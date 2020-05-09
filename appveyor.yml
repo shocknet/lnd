@@ -1,0 +1,21 @@
+version: 1.0.{build}
+image: Ubuntu1804
+skip_tags: true
+environment:
+  GITHUB_TOKEN:
+    secure: eX0omHrG+u98lJiRLG22/bIHWT/zn7YMK86CW6JcHYnYHx83hfpDytzM7qwwyMNH
+before_build:
+- sh: export COMMIT_LOG=`git log -1 --format='%ci %H %s'`
+- sh: npm install -g github-release-cli
+build_script:
+- sh: make release buildtags="experimental"
+- sh: cd ~/projects/lnd && find . -maxdepth 1 -mindepth 1 -type d -name "lnd-*"
+- sh: cd ~/projects/lnd && cd $(find . -maxdepth 1 -mindepth 1 -type d -name "lnd-*"|head -n 1) && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.zip" -exec github-release upload --owner=Emad-salah --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \; && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.tar" -exec github-release upload --owner=Emad-salah --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \; && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.tar.gz" -exec github-release upload --owner=Emad-salah --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \;
+test: off
+# deploy:
+# - provider: GitHub
+#   tag: v$(APPVEYOR_BUILD_VERSION)
+#   release: lnd-v$(APPVEYOR_BUILD_VERSION)
+#   artifact: windows-package
+#   auth_token:
+#     secure: yrYqUuJOQQ2tuGG/cO+HCibFyO8krNX9b45ZxX75uZXJn+6aVdeB/q4tmxm/0gHH
