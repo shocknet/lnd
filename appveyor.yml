@@ -9,8 +9,8 @@ before_build:
 - sh: npm install -g github-release-cli
 build_script:
 - sh: make release buildtags="experimental"
-- sh: cd ~/projects/lnd && find . -maxdepth 1 -mindepth 1 -type d -name "lnd-*"
-- sh: cd ~/projects/lnd && cd $(find . -maxdepth 1 -mindepth 1 -type d -name "lnd-*"|head -n 1) && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.zip" -exec github-release upload --owner=Emad-salah --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \; && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.tar" -exec github-release upload --owner=Emad-salah --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \; && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.tar.gz" -exec github-release upload --owner=Emad-salah --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \;
+- sh: cd ~/projects/lnd-v2pn9 && find . -maxdepth 1 -mindepth 1 -type d -name "lnd-*"
+- sh: cd ~/projects/lnd-v2pn9 && cd $(find . -maxdepth 1 -mindepth 1 -type d -name "lnd-*"|head -n 1) && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.zip" -exec github-release upload --owner=Emad-salah --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \; && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.tar" -exec github-release upload --owner=Emad-salah --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \; && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.tar.gz" -exec github-release upload --owner=Emad-salah --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \;
 test: off
 # deploy:
 # - provider: GitHub
