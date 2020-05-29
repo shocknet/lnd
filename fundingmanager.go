@@ -236,7 +236,7 @@ type fundingConfig struct {
 
 	// PublishTransaction facilitates the process of broadcasting a
 	// transaction to the network.
-	PublishTransaction func(*wire.MsgTx) error
+	PublishTransaction func(*wire.MsgTx, string) error
 
 	// FeeEstimator calculates appropriate fee rates based on historical
 	// transaction information.
@@ -369,6 +369,14 @@ type fundingConfig struct {
 	// NotifyPendingOpenChannelEvent informs the ChannelNotifier when channels
 	// enter a pending state.
 	NotifyPendingOpenChannelEvent func(wire.OutPoint, *channeldb.OpenChannel)
+
+	// EnableUpfrontShutdown specifies whether the upfront shutdown script
+	// is enabled.
+	EnableUpfrontShutdown bool
+
+	// RegisteredChains keeps track of all chains that have been registered
+	// with the daemon.
+	RegisteredChains *chainRegistry
 }
 
 // fundingManager acts as an orchestrator/bridge between the wallet's
@@ -545,7 +553,7 @@ func (f *fundingManager) start() error {
 				channel.IsInitiator {
 
 				err := f.cfg.PublishTransaction(
-					channel.FundingTxn,
+					channel.FundingTxn, "",
 				)
 				if err != nil {
 					fndgLog.Errorf("Unable to rebroadcast "+
@@ -1322,7 +1330,7 @@ func (f *fundingManager) handleFundingOpen(fmsg *fundingOpenMsg) {
 	// A nil address is set in place of user input, because this channel open
 	// was not initiated by the user.
 	shutdown, err := getUpfrontShutdownScript(
-		fmsg.peer, nil,
+		f.cfg.EnableUpfrontShutdown, fmsg.peer, nil,
 		func() (lnwire.DeliveryAddress, error) {
 			addr, err := f.cfg.Wallet.NewAddress(lnwallet.WitnessPubKey, false)
 			if err != nil {
@@ -1987,7 +1995,7 @@ func (f *fundingManager) handleFundingSigned(fmsg *fundingSignedMsg) {
 		fndgLog.Infof("Broadcasting funding tx for ChannelPoint(%v): %v",
 			completeChan.FundingOutpoint, spew.Sdump(fundingTx))
 
-		err = f.cfg.PublishTransaction(fundingTx)
+		err = f.cfg.PublishTransaction(fundingTx, "")
 		if err != nil {
 			fndgLog.Errorf("Unable to broadcast funding tx for "+
 				"ChannelPoint(%v): %v",
@@ -2981,7 +2989,8 @@ func (f *fundingManager) initFundingWorkflow(peer lnpeer.Peer, req *openChanReq)
 // our peer does support the feature, we will return the user provided script
 // if non-zero, or a freshly generated script if our node is configured to set
 // upfront shutdown scripts automatically.
-func getUpfrontShutdownScript(peer lnpeer.Peer, script lnwire.DeliveryAddress,
+func getUpfrontShutdownScript(enableUpfrontShutdown bool, peer lnpeer.Peer,
+	script lnwire.DeliveryAddress,
 	getScript func() (lnwire.DeliveryAddress, error)) (lnwire.DeliveryAddress,
 	error) {
 
@@ -3010,7 +3019,7 @@ func getUpfrontShutdownScript(peer lnpeer.Peer, script lnwire.DeliveryAddress,
 
 	// If we do not have setting of upfront shutdown script enabled, return
 	// an empty script.
-	if !cfg.EnableUpfrontShutdown {
+	if !enableUpfrontShutdown {
 		return nil, nil
 	}
 
@@ -3030,7 +3039,7 @@ func (f *fundingManager) handleInitFundingMsg(msg *initFundingMsg) {
 
 	// We'll determine our dust limit depending on which chain is active.
 	var ourDustLimit btcutil.Amount
-	switch registeredChains.PrimaryChain() {
+	switch f.cfg.RegisteredChains.PrimaryChain() {
 	case bitcoinChain:
 		ourDustLimit = lnwallet.DefaultDustLimit()
 	case litecoinChain:
@@ -3084,7 +3093,8 @@ func (f *fundingManager) handleInitFundingMsg(msg *initFundingMsg) {
 	// address from the wallet if our node is configured to set shutdown
 	// address by default).
 	shutdown, err := getUpfrontShutdownScript(
-		msg.peer, msg.openChanReq.shutdownScript,
+		f.cfg.EnableUpfrontShutdown, msg.peer,
+		msg.openChanReq.shutdownScript,
 		func() (lnwire.DeliveryAddress, error) {
 			addr, err := f.cfg.Wallet.NewAddress(
 				lnwallet.WitnessPubKey, false,
@@ -3467,7 +3477,7 @@ func (f *fundingManager) getChannelOpeningState(chanPoint *wire.OutPoint) (
 
 	var state channelOpeningState
 	var shortChanID lnwire.ShortChannelID
-	err := kvdb.View(f.cfg.Wallet.Cfg.Database, func(tx kvdb.ReadTx) error {
+	err := kvdb.View(f.cfg.Wallet.Cfg.Database, func(tx kvdb.RTx) error {
 
 		bucket := tx.ReadBucket(channelOpeningStateBucket)
 		if bucket == nil {

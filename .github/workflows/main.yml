@@ -6,7 +6,7 @@ name: CI
 # events but only for the master branch
 on:
   schedule:
-  - cron: "*/30 * * * *"
+    - cron: "*/30 * * * *"
 
 # A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
@@ -17,7 +17,7 @@ jobs:
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-    - uses: TG908/fork-sync@v1.1
-      with:
-        owner: lightningnetwork 
-        github_token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: TG908/fork-sync@v1.1
+        with:
+          owner: lightningnetwork
+          github_token: ${{ secrets.GITHUB_TOKEN }}
