@@ -28,12 +28,14 @@ import (
 	"github.com/btcsuite/btcd/rpcclient"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
+	"github.com/btcsuite/btcwallet/wallet"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd"
 	"github.com/lightningnetwork/lnd/chanbackup"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/input"
+	"github.com/lightningnetwork/lnd/lncfg"
 	"github.com/lightningnetwork/lnd/lnrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/invoicesrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/routerrpc"
@@ -646,7 +648,8 @@ func shutdownAndAssert(net *lntest.NetworkHarness, t *harnessTest,
 // payment requests. If the awaitResponse parameter is true, this function
 // does not return until all payments successfully complete without errors.
 func completePaymentRequests(ctx context.Context, client lnrpc.LightningClient,
-	paymentRequests []string, awaitResponse bool) error {
+	routerClient routerrpc.RouterClient, paymentRequests []string,
+	awaitResponse bool) error {
 
 	// We start by getting the current state of the client's channels. This
 	// is needed to ensure the payments actually have been committed before
@@ -658,36 +661,54 @@ func completePaymentRequests(ctx context.Context, client lnrpc.LightningClient,
 		return err
 	}
 
-	ctxc, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// send sends a payment and returns an error if it doesn't succeeded.
+	send := func(payReq string) error {
+		ctxc, cancel := context.WithCancel(ctx)
+		defer cancel()
 
-	payStream, err := client.SendPayment(ctxc)
-	if err != nil {
-		return err
-	}
-
-	for _, payReq := range paymentRequests {
-		sendReq := &lnrpc.SendRequest{
-			PaymentRequest: payReq,
-		}
-		err := payStream.Send(sendReq)
+		payStream, err := routerClient.SendPaymentV2(
+			ctxc,
+			&routerrpc.SendPaymentRequest{
+				PaymentRequest: payReq,
+				TimeoutSeconds: 60,
+				FeeLimitMsat:   noFeeLimitMsat,
+			},
+		)
 		if err != nil {
 			return err
 		}
+
+		resp, err := getPaymentResult(payStream)
+		if err != nil {
+			return err
+		}
+		if resp.Status != lnrpc.Payment_SUCCEEDED {
+			return errors.New(resp.FailureReason)
+		}
+
+		return nil
 	}
 
+	// Launch all payments simultaneously.
+	results := make(chan error)
+	for _, payReq := range paymentRequests {
+		payReqCopy := payReq
+		go func() {
+			err := send(payReqCopy)
+			if awaitResponse {
+				results <- err
+			}
+		}()
+	}
+
+	// If awaiting a response, verify that all payments succeeded.
 	if awaitResponse {
 		for range paymentRequests {
-			resp, err := payStream.Recv()
+			err := <-results
 			if err != nil {
 				return err
 			}
-			if resp.PaymentError != "" {
-				return fmt.Errorf("received payment error: %v",
-					resp.PaymentError)
-			}
 		}
-
 		return nil
 	}
 
@@ -1529,17 +1550,14 @@ func testPaymentFollowingChannelOpen(net *lntest.NetworkHarness, t *harnessTest)
 
 	// Send payment to Bob so that a channel update to disk will be
 	// executed.
-	ctxt, cancel = context.WithTimeout(ctxb, defaultTimeout)
-	defer cancel()
-	_, err = net.Alice.SendPaymentSync(
-		ctxt,
-		&lnrpc.SendRequest{
+	sendAndAssertSuccess(
+		t, net.Alice,
+		&routerrpc.SendPaymentRequest{
 			PaymentRequest: bobPayReqs[0],
+			TimeoutSeconds: 60,
+			FeeLimitSat:    1000000,
 		},
 	)
-	if err != nil {
-		t.Fatalf("unable to create payment stream for alice: %v", err)
-	}
 
 	// At this point we want to make sure the channel is opened and not
 	// pending.
@@ -1967,15 +1985,15 @@ func testUpdateChannelPolicy(net *lntest.NetworkHarness, t *harnessTest) {
 
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
 	err = completePaymentRequests(
-		ctxt, net.Alice, []string{resp.PaymentRequest}, true,
+		ctxt, net.Alice, net.Alice.RouterClient,
+		[]string{resp.PaymentRequest}, true,
 	)
 
 	// Alice knows about the channel policy of Carol and should therefore
 	// not be able to find a path during routing.
-	expErr := channeldb.FailureReasonNoRoute.Error()
-	if err == nil ||
-		!strings.Contains(err.Error(), expErr) {
-		t.Fatalf("expected payment to fail, instead got %v", err)
+	expErr := lnrpc.PaymentFailureReason_FAILURE_REASON_NO_ROUTE
+	if err.Error() != expErr.String() {
+		t.Fatalf("expected %v, instead got %v", expErr, err)
 	}
 
 	// Now we try to send a payment over the channel with a value too low
@@ -2140,7 +2158,8 @@ func testUpdateChannelPolicy(net *lntest.NetworkHarness, t *harnessTest) {
 
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
 	err = completePaymentRequests(
-		ctxt, net.Alice, []string{resp.PaymentRequest}, true,
+		ctxt, net.Alice, net.Alice.RouterClient,
+		[]string{resp.PaymentRequest}, true,
 	)
 	if err != nil {
 		t.Fatalf("unable to send payment: %v", err)
@@ -2948,27 +2967,26 @@ func testChannelUnsettledBalance(net *lntest.NetworkHarness, t *harnessTest) {
 		numInvoices = 6
 	)
 
-	// Create a paystream from Alice to Carol to enable Alice to make
-	// a series of payments.
-	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	alicePayStream, err := net.Alice.SendPayment(ctxt)
-	if err != nil {
-		t.Fatalf("unable to create payment stream for alice: %v", err)
-	}
-
-	// Send payments from Alice to Carol a number of numInvoices
-	// times.
+	// Simulateneously send numInvoices payments from Alice to Carol.
 	carolPubKey := carol.PubKey[:]
+	errChan := make(chan error)
 	for i := 0; i < numInvoices; i++ {
-		err = alicePayStream.Send(&lnrpc.SendRequest{
-			Dest:           carolPubKey,
-			Amt:            int64(payAmt),
-			PaymentHash:    makeFakePayHash(t),
-			FinalCltvDelta: lnd.DefaultBitcoinTimeLockDelta,
-		})
-		if err != nil {
-			t.Fatalf("unable to send alice htlc: %v", err)
-		}
+		go func() {
+			ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
+			_, err := net.Alice.RouterClient.SendPaymentV2(ctxt,
+				&routerrpc.SendPaymentRequest{
+					Dest:           carolPubKey,
+					Amt:            int64(payAmt),
+					PaymentHash:    makeFakePayHash(t),
+					FinalCltvDelta: lnd.DefaultBitcoinTimeLockDelta,
+					TimeoutSeconds: 60,
+					FeeLimitMsat:   noFeeLimitMsat,
+				})
+
+			if err != nil {
+				errChan <- err
+			}
+		}()
 	}
 
 	// Test that the UnsettledBalance for both Alice and Carol
@@ -3010,6 +3028,13 @@ func testChannelUnsettledBalance(net *lntest.NetworkHarness, t *harnessTest) {
 	}, defaultTimeout)
 	if err != nil {
 		t.Fatalf("unsettled balace error: %v", unsettledErr)
+	}
+
+	// Check for payment errors.
+	select {
+	case err := <-errChan:
+		t.Fatalf("payment error: %v", err)
+	default:
 	}
 
 	// Force and assert the channel closure.
@@ -3282,22 +3307,22 @@ func channelForceClosureTest(net *lntest.NetworkHarness, t *harnessTest,
 	// Send payments from Alice to Carol, since Carol is htlchodl mode, the
 	// htlc outputs should be left unsettled, and should be swept by the
 	// utxo nursery.
-	ctx, cancel := context.WithCancel(ctxb)
-	defer cancel()
-
-	alicePayStream, err := alice.SendPayment(ctx)
-	if err != nil {
-		t.Fatalf("unable to create payment stream for alice: %v", err)
-	}
-
 	carolPubKey := carol.PubKey[:]
 	for i := 0; i < numInvoices; i++ {
-		err = alicePayStream.Send(&lnrpc.SendRequest{
-			Dest:           carolPubKey,
-			Amt:            int64(paymentAmt),
-			PaymentHash:    makeFakePayHash(t),
-			FinalCltvDelta: lnd.DefaultBitcoinTimeLockDelta,
-		})
+		ctx, cancel := context.WithCancel(ctxb)
+		defer cancel()
+
+		_, err := alice.RouterClient.SendPaymentV2(
+			ctx,
+			&routerrpc.SendPaymentRequest{
+				Dest:           carolPubKey,
+				Amt:            int64(paymentAmt),
+				PaymentHash:    makeFakePayHash(t),
+				FinalCltvDelta: lnd.DefaultBitcoinTimeLockDelta,
+				TimeoutSeconds: 60,
+				FeeLimitMsat:   noFeeLimitMsat,
+			},
+		)
 		if err != nil {
 			t.Fatalf("unable to send alice htlc: %v", err)
 		}
@@ -4182,6 +4207,34 @@ func testSphinxReplayPersistence(net *lntest.NetworkHarness, t *harnessTest) {
 		},
 	)
 
+	// Next, we'll create Fred who is going to initiate the payment and
+	// establish a channel to from him to Carol. We can't perform this test
+	// by paying from Carol directly to Dave, because the '--unsafe-replay'
+	// setup doesn't apply to locally added htlcs. In that case, the
+	// mailbox, that is responsible for generating the replay, is bypassed.
+	fred, err := net.NewNode("Fred", nil)
+	if err != nil {
+		t.Fatalf("unable to create new nodes: %v", err)
+	}
+	defer shutdownAndAssert(net, t, fred)
+
+	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
+	if err := net.ConnectNodes(ctxt, fred, carol); err != nil {
+		t.Fatalf("unable to connect fred to carol: %v", err)
+	}
+	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
+	err = net.SendCoins(ctxt, btcutil.SatoshiPerBitcoin, fred)
+	if err != nil {
+		t.Fatalf("unable to send coins to fred: %v", err)
+	}
+	ctxt, _ = context.WithTimeout(ctxb, channelOpenTimeout)
+	chanPointFC := openChannelAndAssert(
+		ctxt, t, net, fred, carol,
+		lntest.OpenChannelParams{
+			Amt: chanAmt,
+		},
+	)
+
 	// Now that the channel is open, create an invoice for Dave which
 	// expects a payment of 1000 satoshis from Carol paid via a particular
 	// preimage.
@@ -4198,8 +4251,7 @@ func testSphinxReplayPersistence(net *lntest.NetworkHarness, t *harnessTest) {
 		t.Fatalf("unable to add invoice: %v", err)
 	}
 
-	// Wait for Carol to recognize and advertise the new channel generated
-	// above.
+	// Wait for all channels to be recognized and advertized.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
 	err = carol.WaitForNetworkChannelOpen(ctxt, chanPoint)
 	if err != nil {
@@ -4211,21 +4263,32 @@ func testSphinxReplayPersistence(net *lntest.NetworkHarness, t *harnessTest) {
 		t.Fatalf("bob didn't advertise channel before "+
 			"timeout: %v", err)
 	}
+	err = carol.WaitForNetworkChannelOpen(ctxt, chanPointFC)
+	if err != nil {
+		t.Fatalf("alice didn't advertise channel before "+
+			"timeout: %v", err)
+	}
+	err = fred.WaitForNetworkChannelOpen(ctxt, chanPointFC)
+	if err != nil {
+		t.Fatalf("bob didn't advertise channel before "+
+			"timeout: %v", err)
+	}
 
-	// With the invoice for Dave added, send a payment from Carol paying
+	// With the invoice for Dave added, send a payment from Fred paying
 	// to the above generated invoice.
 	ctx, cancel := context.WithCancel(ctxb)
 	defer cancel()
 
-	payStream, err := carol.SendPayment(ctx)
+	payStream, err := fred.RouterClient.SendPaymentV2(
+		ctx,
+		&routerrpc.SendPaymentRequest{
+			PaymentRequest: invoiceResp.PaymentRequest,
+			TimeoutSeconds: 60,
+			FeeLimitMsat:   noFeeLimitMsat,
+		},
+	)
 	if err != nil {
 		t.Fatalf("unable to open payment stream: %v", err)
-	}
-
-	sendReq := &lnrpc.SendRequest{PaymentRequest: invoiceResp.PaymentRequest}
-	err = payStream.Send(sendReq)
-	if err != nil {
-		t.Fatalf("unable to send payment: %v", err)
 	}
 
 	time.Sleep(200 * time.Millisecond)
@@ -4265,17 +4328,17 @@ func testSphinxReplayPersistence(net *lntest.NetworkHarness, t *harnessTest) {
 	// pending payment. Even though he still holds the original settle, if
 	// he does fail, it is almost certainly caused by the sphinx replay
 	// protection, as it is the only validation we do in hodl mode.
-	resp, err := payStream.Recv()
+	result, err := getPaymentResult(payStream)
 	if err != nil {
 		t.Fatalf("unable to receive payment response: %v", err)
 	}
 
-	// Construct the response we expect after sending a duplicate packet
-	// that fails due to sphinx replay detection.
-	if resp.PaymentError == "" {
+	// Assert that Fred receives the expected failure after Carol sent a
+	// duplicate packet that fails due to sphinx replay detection.
+	if result.Status == lnrpc.Payment_SUCCEEDED {
 		t.Fatalf("expected payment error")
 	}
-	assertLastHTLCError(t, carol, lnrpc.Failure_INVALID_ONION_KEY)
+	assertLastHTLCError(t, fred, lnrpc.Failure_INVALID_ONION_KEY)
 
 	// Since the payment failed, the balance should still be left
 	// unaltered.
@@ -4357,17 +4420,14 @@ func testListPayments(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// With the invoice for Bob added, send a payment towards Alice paying
 	// to the above generated invoice.
-	sendReq := &lnrpc.SendRequest{
-		PaymentRequest: invoiceResp.PaymentRequest,
-	}
-	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	resp, err := net.Alice.SendPaymentSync(ctxt, sendReq)
-	if err != nil {
-		t.Fatalf("unable to send payment: %v", err)
-	}
-	if resp.PaymentError != "" {
-		t.Fatalf("error when attempting recv: %v", resp.PaymentError)
-	}
+	sendAndAssertSuccess(
+		t, net.Alice,
+		&routerrpc.SendPaymentRequest{
+			PaymentRequest: invoiceResp.PaymentRequest,
+			TimeoutSeconds: 60,
+			FeeLimitSat:    1000000,
+		},
+	)
 
 	// Grab Alice's list of payments, she should show the existence of
 	// exactly one payment.
@@ -4830,7 +4890,7 @@ func testSingleHopSendToRouteCase(net *lntest.NetworkHarness, t *harnessTest,
 				Route:       r,
 			}
 			ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-			resp, err := carol.RouterClient.SendToRoute(
+			resp, err := carol.RouterClient.SendToRouteV2(
 				ctxt, sendReq,
 			)
 			if err != nil {
@@ -5609,7 +5669,9 @@ func testPrivateChannels(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// Let Carol pay the invoices.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	err = completePaymentRequests(ctxt, carol, payReqs, true)
+	err = completePaymentRequests(
+		ctxt, carol, carol.RouterClient, payReqs, true,
+	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
 	}
@@ -5665,7 +5727,9 @@ func testPrivateChannels(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// Let Bob pay the invoices.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	err = completePaymentRequests(ctxt, net.Alice, payReqs, true)
+	err = completePaymentRequests(
+		ctxt, net.Alice, net.Alice.RouterClient, payReqs, true,
+	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
 	}
@@ -6141,7 +6205,9 @@ func testMultiHopOverPrivateChannels(net *lntest.NetworkHarness, t *harnessTest)
 	// Let Alice pay the invoice.
 	payReqs := []string{resp.PaymentRequest}
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	err = completePaymentRequests(ctxt, net.Alice, payReqs, true)
+	err = completePaymentRequests(
+		ctxt, net.Alice, net.Alice.RouterClient, payReqs, true,
+	)
 	if err != nil {
 		t.Fatalf("unable to send payments from alice to dave: %v", err)
 	}
@@ -6277,18 +6343,25 @@ func testInvoiceSubscriptions(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// With the assertion above set up, send a payment from Alice to Bob
 	// which should finalize and settle the invoice.
-	sendReq := &lnrpc.SendRequest{
+	sendReq := &routerrpc.SendPaymentRequest{
 		PaymentRequest: invoiceResp.PaymentRequest,
+		TimeoutSeconds: 60,
+		FeeLimitMsat:   noFeeLimitMsat,
 	}
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	resp, err := net.Alice.SendPaymentSync(ctxt, sendReq)
+	stream, err := net.Alice.RouterClient.SendPaymentV2(ctxt, sendReq)
 	if err != nil {
 		close(quit)
 		t.Fatalf("unable to send payment: %v", err)
 	}
-	if resp.PaymentError != "" {
+	result, err := getPaymentResult(stream)
+	if err != nil {
 		close(quit)
-		t.Fatalf("error when attempting recv: %v", resp.PaymentError)
+		t.Fatalf("cannot get payment result: %v", err)
+	}
+	if result.Status != lnrpc.Payment_SUCCEEDED {
+		close(quit)
+		t.Fatalf("error when attempting recv: %v", result.Status)
 	}
 
 	select {
@@ -6352,7 +6425,7 @@ func testInvoiceSubscriptions(net *lntest.NetworkHarness, t *harnessTest) {
 	// can test that all settled invoices are properly notified.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
 	err = completePaymentRequests(
-		ctxt, net.Alice, payReqs, true,
+		ctxt, net.Alice, net.Alice.RouterClient, payReqs, true,
 	)
 	if err != nil {
 		t.Fatalf("unable to send payment: %v", err)
@@ -6695,7 +6768,7 @@ func testBasicChannelCreationAndUpdates(net *lntest.NetworkHarness, t *harnessTe
 func testMaxPendingChannels(net *lntest.NetworkHarness, t *harnessTest) {
 	ctxb := context.Background()
 
-	maxPendingChannels := lnd.DefaultMaxPendingChannels + 1
+	maxPendingChannels := lncfg.DefaultMaxPendingChannels + 1
 	amount := lnd.MaxBtcFundingAmount
 
 	// Create a new node (Carol) with greater number of max pending
@@ -6932,7 +7005,9 @@ func testFailingChannel(net *lntest.NetworkHarness, t *harnessTest) {
 	// Send the payment from Alice to Carol. We expect Carol to attempt to
 	// settle this payment with the wrong preimage.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	err = completePaymentRequests(ctxt, net.Alice, carolPayReqs, false)
+	err = completePaymentRequests(
+		ctxt, net.Alice, net.Alice.RouterClient, carolPayReqs, false,
+	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
 	}
@@ -7404,8 +7479,10 @@ func testRevokedCloseRetribution(net *lntest.NetworkHarness, t *harnessTest) {
 	// Send payments from Carol to Bob using 3 of Bob's payment hashes
 	// generated above.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	err = completePaymentRequests(ctxt, carol, bobPayReqs[:numInvoices/2],
-		true)
+	err = completePaymentRequests(
+		ctxt, carol, carol.RouterClient, bobPayReqs[:numInvoices/2],
+		true,
+	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
 	}
@@ -7458,8 +7535,10 @@ func testRevokedCloseRetribution(net *lntest.NetworkHarness, t *harnessTest) {
 	// Finally, send payments from Carol to Bob, consuming Bob's remaining
 	// payment hashes.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	err = completePaymentRequests(ctxt, carol, bobPayReqs[numInvoices/2:],
-		true)
+	err = completePaymentRequests(
+		ctxt, carol, carol.RouterClient, bobPayReqs[numInvoices/2:],
+		true,
+	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
 	}
@@ -7586,6 +7665,15 @@ func testRevokedCloseRetribution(net *lntest.NetworkHarness, t *harnessTest) {
 	}
 
 	assertNodeNumChannels(t, carol, 0)
+
+	// Mine enough blocks for Bob's channel arbitrator to wrap up the
+	// references to the breached channel. The chanarb waits for commitment
+	// tx's confHeight+CSV-1 blocks and since we've already mined one that
+	// included the justice tx we only need to mine extra DefaultCSV-2
+	// blocks to unlock it.
+	mineBlocks(t, net, lntest.DefaultCSV-2, 0)
+
+	assertNumPendingChannels(t, net.Bob, 0, 0)
 }
 
 // testRevokedCloseRetributionZeroValueRemoteOutput tests that Dave is able
@@ -7702,7 +7790,9 @@ func testRevokedCloseRetributionZeroValueRemoteOutput(net *lntest.NetworkHarness
 	// Finally, send payments from Dave to Carol, consuming Carol's remaining
 	// payment hashes.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	err = completePaymentRequests(ctxt, dave, carolPayReqs, false)
+	err = completePaymentRequests(
+		ctxt, dave, dave.RouterClient, carolPayReqs, false,
+	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
 	}
@@ -7955,7 +8045,8 @@ func testRevokedCloseRetributionRemoteHodl(net *lntest.NetworkHarness,
 	// generated above.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
 	err = completePaymentRequests(
-		ctxt, dave, carolPayReqs[:numInvoices/2], false,
+		ctxt, dave, dave.RouterClient, carolPayReqs[:numInvoices/2],
+		false,
 	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
@@ -7975,7 +8066,8 @@ func testRevokedCloseRetributionRemoteHodl(net *lntest.NetworkHarness,
 	// generated above.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
 	err = completePaymentRequests(
-		ctxt, carol, davePayReqs[:numInvoices/2], false,
+		ctxt, carol, carol.RouterClient, davePayReqs[:numInvoices/2],
+		false,
 	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
@@ -8023,7 +8115,8 @@ func testRevokedCloseRetributionRemoteHodl(net *lntest.NetworkHarness,
 	// remaining payment hashes.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
 	err = completePaymentRequests(
-		ctxt, dave, carolPayReqs[numInvoices/2:], false,
+		ctxt, dave, dave.RouterClient, carolPayReqs[numInvoices/2:],
+		false,
 	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
@@ -8422,7 +8515,9 @@ func testRevokedCloseRetributionAltruistWatchtower(net *lntest.NetworkHarness,
 
 	// Finally, send payments from Dave to Carol, consuming Carol's remaining
 	// payment hashes.
-	err = completePaymentRequests(ctxb, dave, carolPayReqs, false)
+	err = completePaymentRequests(
+		ctxb, dave, dave.RouterClient, carolPayReqs, false,
+	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
 	}
@@ -8883,8 +8978,10 @@ func testDataLossProtection(net *lntest.NetworkHarness, t *harnessTest) {
 		// Send payments from Carol using 3 of the payment hashes
 		// generated above.
 		ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-		err = completePaymentRequests(ctxt, carol,
-			payReqs[:numInvoices/2], true)
+		err = completePaymentRequests(
+			ctxt, carol, carol.RouterClient,
+			payReqs[:numInvoices/2], true,
+		)
 		if err != nil {
 			t.Fatalf("unable to send payments: %v", err)
 		}
@@ -8938,8 +9035,10 @@ func testDataLossProtection(net *lntest.NetworkHarness, t *harnessTest) {
 		// Finally, send more payments from , using the remaining
 		// payment hashes.
 		ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-		err = completePaymentRequests(ctxt, carol,
-			payReqs[numInvoices/2:], true)
+		err = completePaymentRequests(
+			ctxt, carol, carol.RouterClient,
+			payReqs[numInvoices/2:], true,
+		)
 		if err != nil {
 			t.Fatalf("unable to send payments: %v", err)
 		}
@@ -9243,7 +9342,8 @@ func testRejectHTLC(net *lntest.NetworkHarness, t *harnessTest) {
 	// Alice pays Carols invoice.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
 	err = completePaymentRequests(
-		ctxt, net.Alice, []string{resp.PaymentRequest}, true,
+		ctxt, net.Alice, net.Alice.RouterClient,
+		[]string{resp.PaymentRequest}, true,
 	)
 	if err != nil {
 		t.Fatalf("unable to send payments from alice to carol: %v", err)
@@ -9268,7 +9368,8 @@ func testRejectHTLC(net *lntest.NetworkHarness, t *harnessTest) {
 	// Carol pays Bobs invoice.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
 	err = completePaymentRequests(
-		ctxt, carol, []string{resp.PaymentRequest}, true,
+		ctxt, carol, carol.RouterClient,
+		[]string{resp.PaymentRequest}, true,
 	)
 	if err != nil {
 		t.Fatalf("unable to send payments from carol to bob: %v", err)
@@ -9296,7 +9397,8 @@ func testRejectHTLC(net *lntest.NetworkHarness, t *harnessTest) {
 	// --rejecthtlc.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
 	err = completePaymentRequests(
-		ctxt, net.Alice, []string{resp.PaymentRequest}, true,
+		ctxt, net.Alice, net.Alice.RouterClient,
+		[]string{resp.PaymentRequest}, true,
 	)
 	if err == nil {
 		t.Fatalf(
@@ -9840,33 +9942,45 @@ func testAsyncPayments(net *lntest.NetworkHarness, t *harnessTest) {
 			"timeout: %v", err)
 	}
 
-	// Open up a payment stream to Alice that we'll use to send payment to
-	// Bob. We also create a small helper function to send payments to Bob,
-	// consuming the payment hashes we generated above.
-	ctxt, _ = context.WithTimeout(ctxb, lntest.AsyncBenchmarkTimeout)
-	alicePayStream, err := net.Alice.SendPayment(ctxt)
-	if err != nil {
-		t.Fatalf("unable to create payment stream for alice: %v", err)
-	}
-
-	// Send payments from Alice to Bob using of Bob's payment hashes
-	// generated above.
+	// Simultaneously send payments from Alice to Bob using of Bob's payment
+	// hashes generated above.
 	now := time.Now()
+	errChan := make(chan error)
+	statusChan := make(chan *lnrpc.Payment)
 	for i := 0; i < numInvoices; i++ {
-		sendReq := &lnrpc.SendRequest{
-			PaymentRequest: bobPayReqs[i],
-		}
+		payReq := bobPayReqs[i]
+		go func() {
+			ctxt, _ = context.WithTimeout(ctxb, lntest.AsyncBenchmarkTimeout)
+			stream, err := net.Alice.RouterClient.SendPaymentV2(
+				ctxt,
+				&routerrpc.SendPaymentRequest{
+					PaymentRequest: payReq,
+					TimeoutSeconds: 60,
+					FeeLimitMsat:   noFeeLimitMsat,
+				},
+			)
+			if err != nil {
+				errChan <- err
+			}
+			result, err := getPaymentResult(stream)
+			if err != nil {
+				errChan <- err
+			}
 
-		if err := alicePayStream.Send(sendReq); err != nil {
-			t.Fatalf("unable to send payment: "+
-				"stream has been closed: %v", err)
-		}
+			statusChan <- result
+		}()
 	}
 
 	// Wait until all the payments have settled.
 	for i := 0; i < numInvoices; i++ {
-		if _, err := alicePayStream.Recv(); err != nil {
-			t.Fatalf("payment stream have been closed: %v", err)
+		select {
+		case result := <-statusChan:
+			if result.Status == lnrpc.Payment_SUCCEEDED {
+				continue
+			}
+
+		case err := <-errChan:
+			t.Fatalf("payment error: %v", err)
 		}
 	}
 
@@ -10011,90 +10125,51 @@ func testBidirectionalAsyncPayments(net *lntest.NetworkHarness, t *harnessTest) 
 		t.Fatalf("unable to reset mc for alice: %v", err)
 	}
 
-	// Open up a payment streams to Alice and to Bob, that we'll use to
-	// send payment between nodes.
-	ctx, cancel := context.WithTimeout(ctxb, lntest.AsyncBenchmarkTimeout)
-	defer cancel()
-
-	alicePayStream, err := net.Alice.SendPayment(ctx)
-	if err != nil {
-		t.Fatalf("unable to create payment stream for alice: %v", err)
-	}
-
-	ctx, cancel = context.WithTimeout(ctxb, lntest.AsyncBenchmarkTimeout)
-	defer cancel()
-
-	bobPayStream, err := net.Bob.SendPayment(ctx)
-	if err != nil {
-		t.Fatalf("unable to create payment stream for bob: %v", err)
-	}
-
 	// Send payments from Alice to Bob and from Bob to Alice in async
 	// manner.
-	for i := 0; i < numInvoices; i++ {
-		aliceSendReq := &lnrpc.SendRequest{
-			PaymentRequest: bobPayReqs[i],
-		}
+	errChan := make(chan error)
+	statusChan := make(chan *lnrpc.Payment)
 
-		bobSendReq := &lnrpc.SendRequest{
-			PaymentRequest: alicePayReqs[i],
-		}
+	send := func(node *lntest.HarnessNode, payReq string) {
+		go func() {
+			ctxt, _ = context.WithTimeout(
+				ctxb, lntest.AsyncBenchmarkTimeout,
+			)
+			stream, err := node.RouterClient.SendPaymentV2(
+				ctxt,
+				&routerrpc.SendPaymentRequest{
+					PaymentRequest: payReq,
+					TimeoutSeconds: 60,
+					FeeLimitMsat:   noFeeLimitMsat,
+				},
+			)
+			if err != nil {
+				errChan <- err
+			}
+			result, err := getPaymentResult(stream)
+			if err != nil {
+				errChan <- err
+			}
 
-		if err := alicePayStream.Send(aliceSendReq); err != nil {
-			t.Fatalf("unable to send payment: "+
-				"%v", err)
-		}
-
-		if err := bobPayStream.Send(bobSendReq); err != nil {
-			t.Fatalf("unable to send payment: "+
-				"%v", err)
-		}
+			statusChan <- result
+		}()
 	}
 
-	errChan := make(chan error)
-	go func() {
-		for i := 0; i < numInvoices; i++ {
-			if resp, err := alicePayStream.Recv(); err != nil {
-				errChan <- errors.Errorf("payment stream has"+
-					" been closed: %v", err)
-				return
-			} else if resp.PaymentError != "" {
-				errChan <- errors.Errorf("unable to send "+
-					"payment from alice to bob: %v",
-					resp.PaymentError)
-				return
-			}
-		}
-		errChan <- nil
-	}()
+	for i := 0; i < numInvoices; i++ {
+		send(net.Bob, alicePayReqs[i])
+		send(net.Alice, bobPayReqs[i])
+	}
 
-	go func() {
-		for i := 0; i < numInvoices; i++ {
-			if resp, err := bobPayStream.Recv(); err != nil {
-				errChan <- errors.Errorf("payment stream has"+
-					" been closed: %v", err)
-				return
-			} else if resp.PaymentError != "" {
-				errChan <- errors.Errorf("unable to send "+
-					"payment from bob to alice: %v",
-					resp.PaymentError)
-				return
-			}
-		}
-		errChan <- nil
-	}()
-
-	// Wait for Alice and Bob receive their payments, and throw and error
-	// if something goes wrong.
-	for i := 0; i < 2; i++ {
+	// Expect all payments to succeed.
+	for i := 0; i < 2*numInvoices; i++ {
 		select {
-		case err := <-errChan:
-			if err != nil {
-				t.Fatalf(err.Error())
+		case result := <-statusChan:
+			if result.Status != lnrpc.Payment_SUCCEEDED {
+				t.Fatalf("payment error: %v", result.Status)
 			}
-		case <-time.After(lntest.AsyncBenchmarkTimeout):
-			t.Fatalf("waiting for payments to finish too long "+
-				"(%v)", lntest.AsyncBenchmarkTimeout)
+
+		case err := <-errChan:
+			t.Fatalf("payment error: %v", err)
 		}
 	}
 
@@ -10457,7 +10532,9 @@ func testSwitchCircuitPersistence(net *lntest.NetworkHarness, t *harnessTest) {
 	// Using Carol as the source, pay to the 5 invoices from Bob created
 	// above.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	err = completePaymentRequests(ctxt, net.Bob, payReqs, false)
+	err = completePaymentRequests(
+		ctxt, net.Bob, net.Bob.RouterClient, payReqs, false,
+	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
 	}
@@ -10583,7 +10660,9 @@ func testSwitchCircuitPersistence(net *lntest.NetworkHarness, t *harnessTest) {
 	// Using Carol as the source, pay to the 5 invoices from Bob created
 	// above.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	err = completePaymentRequests(ctxt, net.Bob, payReqs, true)
+	err = completePaymentRequests(
+		ctxt, net.Bob, net.Bob.RouterClient, payReqs, true,
+	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
 	}
@@ -10780,7 +10859,9 @@ func testSwitchOfflineDelivery(net *lntest.NetworkHarness, t *harnessTest) {
 	// Using Carol as the source, pay to the 5 invoices from Bob created
 	// above.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	err = completePaymentRequests(ctxt, net.Bob, payReqs, false)
+	err = completePaymentRequests(
+		ctxt, net.Bob, net.Bob.RouterClient, payReqs, false,
+	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
 	}
@@ -10912,7 +10993,9 @@ func testSwitchOfflineDelivery(net *lntest.NetworkHarness, t *harnessTest) {
 	// Using Carol as the source, pay to the 5 invoices from Bob created
 	// above.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	err = completePaymentRequests(ctxt, net.Bob, payReqs, true)
+	err = completePaymentRequests(
+		ctxt, net.Bob, net.Bob.RouterClient, payReqs, true,
+	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
 	}
@@ -11109,7 +11192,9 @@ func testSwitchOfflineDeliveryPersistence(net *lntest.NetworkHarness, t *harness
 	// Using Carol as the source, pay to the 5 invoices from Bob created
 	// above.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	err = completePaymentRequests(ctxt, net.Bob, payReqs, false)
+	err = completePaymentRequests(
+		ctxt, net.Bob, net.Bob.RouterClient, payReqs, false,
+	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
 	}
@@ -11248,7 +11333,9 @@ func testSwitchOfflineDeliveryPersistence(net *lntest.NetworkHarness, t *harness
 	// Using Carol as the source, pay to the 5 invoices from Bob created
 	// above.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	err = completePaymentRequests(ctxt, net.Bob, payReqs, true)
+	err = completePaymentRequests(
+		ctxt, net.Bob, net.Bob.RouterClient, payReqs, true,
+	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
 	}
@@ -11443,7 +11530,9 @@ func testSwitchOfflineDeliveryOutgoingOffline(
 	// Using Carol as the source, pay to the 5 invoices from Bob created
 	// above.
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-	err = completePaymentRequests(ctxt, net.Bob, payReqs, false)
+	err = completePaymentRequests(
+		ctxt, net.Bob, net.Bob.RouterClient, payReqs, false,
+	)
 	if err != nil {
 		t.Fatalf("unable to send payments: %v", err)
 	}
@@ -11991,21 +12080,21 @@ func testRouteFeeCutoff(net *lntest.NetworkHarness, t *harnessTest) {
 			t.Fatalf("unable to create invoice: %v", err)
 		}
 
-		sendReq := &lnrpc.SendRequest{
+		sendReq := &routerrpc.SendPaymentRequest{
 			PaymentRequest: invoiceResp.PaymentRequest,
-			FeeLimit:       feeLimit,
+			TimeoutSeconds: 60,
+			FeeLimitMsat:   noFeeLimitMsat,
 		}
-		ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
-		paymentResp, err := net.Alice.SendPaymentSync(ctxt, sendReq)
-		if err != nil {
-			t.Fatalf("unable to send payment: %v", err)
-		}
-		if paymentResp.PaymentError != "" {
-			t.Fatalf("unable to send payment: %v",
-				paymentResp.PaymentError)
+		switch limit := feeLimit.Limit.(type) {
+		case *lnrpc.FeeLimit_Fixed:
+			sendReq.FeeLimitMsat = 1000 * limit.Fixed
+		case *lnrpc.FeeLimit_Percent:
+			sendReq.FeeLimitMsat = 1000 * paymentAmt * limit.Percent / 100
 		}
 
-		checkRoute(paymentResp.PaymentRoute)
+		result := sendAndAssertSuccess(t, net.Alice, sendReq)
+
+		checkRoute(result.Htlcs[0].Route)
 	}
 
 	// We'll start off using percentages first. Since the fee along the
@@ -12476,9 +12565,13 @@ func testSweepAllCoins(net *lntest.NetworkHarness, t *harnessTest) {
 		t.Fatalf("unable to get node info: %v", err)
 	}
 
+	// Create a label that we will used to label the transaction with.
+	sendCoinsLabel := "send all coins"
+
 	sweepReq := &lnrpc.SendCoinsRequest{
 		Addr:    info.IdentityPubkey,
 		SendAll: true,
+		Label:   sendCoinsLabel,
 	}
 	_, err = ainz.SendCoins(ctxt, sweepReq)
 	if err == nil {
@@ -12494,6 +12587,7 @@ func testSweepAllCoins(net *lntest.NetworkHarness, t *harnessTest) {
 	sweepReq = &lnrpc.SendCoinsRequest{
 		Addr:    info.IdentityPubkey,
 		SendAll: true,
+		Label:   sendCoinsLabel,
 	}
 	_, err = ainz.SendCoins(ctxt, sweepReq)
 	if err == nil {
@@ -12512,6 +12606,7 @@ func testSweepAllCoins(net *lntest.NetworkHarness, t *harnessTest) {
 	sweepReq = &lnrpc.SendCoinsRequest{
 		Addr:    "tb1qfc8fusa98jx8uvnhzavxccqlzvg749tvjw82tg",
 		SendAll: true,
+		Label:   sendCoinsLabel,
 	}
 	_, err = ainz.SendCoins(ctxt, sweepReq)
 	if err == nil {
@@ -12523,6 +12618,7 @@ func testSweepAllCoins(net *lntest.NetworkHarness, t *harnessTest) {
 	sweepReq = &lnrpc.SendCoinsRequest{
 		Addr:    "1MPaXKp5HhsLNjVSqaL7fChE3TVyrTMRT3",
 		SendAll: true,
+		Label:   sendCoinsLabel,
 	}
 	_, err = ainz.SendCoins(ctxt, sweepReq)
 	if err == nil {
@@ -12538,6 +12634,7 @@ func testSweepAllCoins(net *lntest.NetworkHarness, t *harnessTest) {
 	sweepReq = &lnrpc.SendCoinsRequest{
 		Addr:    minerAddr.String(),
 		SendAll: true,
+		Label:   sendCoinsLabel,
 	}
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
 	_, err = ainz.SendCoins(ctxt, sweepReq)
@@ -12555,6 +12652,66 @@ func testSweepAllCoins(net *lntest.NetworkHarness, t *harnessTest) {
 	if len(sweepTx.TxIn) != 2 {
 		t.Fatalf("expected 2 inputs instead have %v", len(sweepTx.TxIn))
 	}
+
+	sweepTxStr := sweepTx.TxHash().String()
+	assertTxLabel(ctxb, t, ainz, sweepTxStr, sendCoinsLabel)
+
+	// While we are looking at labels, we test our label transaction command
+	// to make sure it is behaving as expected. First, we try to label our
+	// transaction with an empty label, and check that we fail as expected.
+	sweepHash := sweepTx.TxHash()
+	_, err = ainz.WalletKitClient.LabelTransaction(
+		ctxt, &walletrpc.LabelTransactionRequest{
+			Txid:      sweepHash[:],
+			Label:     "",
+			Overwrite: false,
+		},
+	)
+	if err == nil {
+		t.Fatalf("expected error for zero transaction label")
+	}
+
+	// Our error will be wrapped in a rpc error, so we check that it
+	// contains the error we expect.
+	if !strings.Contains(err.Error(), walletrpc.ErrZeroLabel.Error()) {
+		t.Fatalf("expected: zero label error, got: %v", err)
+	}
+
+	// Next, we try to relabel our transaction without setting the overwrite
+	// boolean. We expect this to fail, because the wallet requires setting
+	// of this param to prevent accidental overwrite of labels.
+	_, err = ainz.WalletKitClient.LabelTransaction(
+		ctxt, &walletrpc.LabelTransactionRequest{
+			Txid:      sweepHash[:],
+			Label:     "label that will not work",
+			Overwrite: false,
+		},
+	)
+	if err == nil {
+		t.Fatalf("expected error for tx already labelled")
+	}
+
+	// Our error will be wrapped in a rpc error, so we check that it
+	// contains the error we expect.
+	if !strings.Contains(err.Error(), wallet.ErrTxLabelExists.Error()) {
+		t.Fatalf("expected: label exists, got: %v", err)
+	}
+
+	// Finally, we overwrite our label with a new label, which should not
+	// fail.
+	newLabel := "new sweep tx label"
+	_, err = ainz.WalletKitClient.LabelTransaction(
+		ctxt, &walletrpc.LabelTransactionRequest{
+			Txid:      sweepHash[:],
+			Label:     newLabel,
+			Overwrite: true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("could not label tx: %v", err)
+	}
+
+	assertTxLabel(ctxb, t, ainz, sweepTxStr, newLabel)
 
 	// Finally, Ainz should now have no coins at all within his wallet.
 	balReq := &lnrpc.WalletBalanceRequest{}
@@ -12578,6 +12735,35 @@ func testSweepAllCoins(net *lntest.NetworkHarness, t *harnessTest) {
 	_, err = ainz.SendCoins(ctxt, sweepReq)
 	if err == nil {
 		t.Fatalf("sweep attempt should fail")
+	}
+}
+
+// assertTxLabel is a helper function which finds a target tx in our set
+// of transactions and checks that it has the desired label.
+func assertTxLabel(ctx context.Context, t *harnessTest,
+	node *lntest.HarnessNode, targetTx, label string) {
+
+	// List all transactions relevant to our wallet, and find the tx so that
+	// we can check the correct label has been set.
+	ctxt, cancel := context.WithTimeout(ctx, defaultTimeout)
+	defer cancel()
+
+	txResp, err := node.GetTransactions(
+		ctxt, &lnrpc.GetTransactionsRequest{},
+	)
+	if err != nil {
+		t.Fatalf("could not get transactions: %v", err)
+	}
+
+	// Find our transaction in the set of transactions returned and check
+	// its label.
+	for _, txn := range txResp.Transactions {
+		if txn.TxHash == targetTx {
+			if txn.Label != label {
+				t.Fatalf("expected label: %v, got: %v",
+					label, txn.Label)
+			}
+		}
 	}
 }
 
@@ -13106,8 +13292,8 @@ func testChanRestoreScenario(t *harnessTest, net *lntest.NetworkHarness,
 
 		ctxt, _ := context.WithTimeout(ctxb, defaultTimeout)
 		err = completePaymentRequests(
-			ctxt, from, []string{invoiceResp.PaymentRequest},
-			true,
+			ctxt, from, from.RouterClient,
+			[]string{invoiceResp.PaymentRequest}, true,
 		)
 		if err != nil {
 			t.Fatalf("unable to complete payments: %v", err)
@@ -14135,7 +14321,8 @@ func testExternalFundingChanPoint(net *lntest.NetworkHarness, t *harnessTest) {
 	}
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
 	err = completePaymentRequests(
-		ctxt, carol, []string{resp.PaymentRequest}, true,
+		ctxt, carol, carol.RouterClient, []string{resp.PaymentRequest},
+		true,
 	)
 	if err != nil {
 		t.Fatalf("unable to make payments between Carol and Dave")
@@ -14181,6 +14368,37 @@ func sendAndAssertSuccess(t *harnessTest, node *lntest.HarnessNode,
 
 	if result.Status != lnrpc.Payment_SUCCEEDED {
 		t.Fatalf("payment failed: %v", result.Status)
+	}
+
+	return result
+}
+
+// sendAndAssertFailure sends the given payment requests and asserts that the
+// payment fails with the expected reason.
+func sendAndAssertFailure(t *harnessTest, node *lntest.HarnessNode,
+	req *routerrpc.SendPaymentRequest,
+	failureReason lnrpc.PaymentFailureReason) *lnrpc.Payment {
+
+	ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+	defer cancel()
+
+	stream, err := node.RouterClient.SendPaymentV2(ctx, req)
+	if err != nil {
+		t.Fatalf("unable to send payment: %v", err)
+	}
+
+	result, err := getPaymentResult(stream)
+	if err != nil {
+		t.Fatalf("unable to get payment result: %v", err)
+	}
+
+	if result.Status != lnrpc.Payment_FAILED {
+		t.Fatalf("payment was expected to fail, but succeeded")
+	}
+
+	if result.FailureReason != failureReason {
+		t.Fatalf("payment should have been rejected due to "+
+			"%v, but got %v", failureReason, result.Status)
 	}
 
 	return result

@@ -24,12 +24,14 @@
 <time> [ERR] CRTR: Channel update of ourselves received
 <time> [ERR] CRTR: Error collecting result for shard <number> for payment <hex>: shard handler exiting
 <time> [ERR] CRTR: Error encountered during rescan: rescan exited
+<time> [ERR] CRTR: Failed sending attempt <number> for payment <hex> to switch: could not add downstream htlc
 <time> [ERR] CRTR: Failed sending attempt <number> for payment <hex> to switch: insufficient bandwidth to route htlc
 <time> [ERR] CRTR: Failed sending attempt <number> for payment <hex> to switch: UnknownNextPeer
 <time> [ERR] CRTR: out of order block: expecting height=<height>, got height=<height>
 <time> [ERR] CRTR: Payment with hash <hex> failed: error
 <time> [ERR] CRTR: Payment with hash <hex> failed: incorrect_payment_details
 <time> [ERR] CRTR: Payment with hash <hex> failed: insufficient_balance
+<time> [ERR] CRTR: Payment with hash <hex> failed: no_route
 <time> [ERR] CRTR: Payment with hash <hex> failed: router shutting down
 <time> [ERR] CRTR: Resuming payment with hash <hex> failed: error.
 <time> [ERR] CRTR: Resuming payment with hash <hex> failed: incorrect_payment_details.
@@ -46,6 +48,7 @@
 <time> [ERR] FNDG: received funding error from <hex>: chan_id=<hex>, err=Number of pending channels exceed maximum
 <time> [ERR] FNDG: received funding error from <hex>: chan_id=<hex>, err=Synchronizing blockchain
 <time> [ERR] FNDG: Unable to add new channel <chan_point> with peer <hex>: peer exiting
+<time> [ERR] FNDG: Unable to add new channel <chan_point> with peer <hex>: unable to get best block: the client has been shutdown
 <time> [ERR] FNDG: Unable to advance pending state of ChannelPoint(<chan_point>): error waiting for funding confirmation for ChannelPoint(<chan_point>): epoch client shutting down
 <time> [ERR] FNDG: Unable to advance pending state of ChannelPoint(<chan_point>): error waiting for funding confirmation for ChannelPoint(<chan_point>): funding manager shutting down
 <time> [ERR] FNDG: Unable to advance pending state of ChannelPoint(<chan_point>): error waiting for funding confirmation for ChannelPoint(<chan_point>): waiting for fundingconfirmation failed
@@ -55,6 +58,7 @@
 <time> [ERR] FNDG: Unable to advance state(<chan_point>): error sending channel announcement: channel announcement failed: router shutting down
 <time> [ERR] FNDG: Unable to advance state(<chan_point>): error sending channel announcement: channel announcement failed: unable add proof to the channel chanID=<hex>: edge marked as zombie
 <time> [ERR] FNDG: Unable to advance state(<chan_point>): error sending channel announcement: channel announcement failed: unable add proof to the channel chanID=<hex>: edge not found
+<time> [ERR] FNDG: Unable to advance state(<chan_point>): failed adding to router graph: error sending channel announcement: router shutting down
 <time> [ERR] FNDG: Unable to advance state(<chan_point>): failed adding to router graph: funding manager shutting down
 <time> [ERR] FNDG: Unable to advance state(<chan_point>): failed sending fundingLocked: funding manager shutting down
 <time> [ERR] FNDG: unable to cancel reservation: no active reservations for peer(<hex>)
@@ -78,6 +82,7 @@
 <time> [ERR] HSWC: ChannelLink(<chan>): link failed, exiting htlcManager
 <time> [ERR] HSWC: ChannelLink(<chan>): outgoing htlc(<hex>) has insufficient fee: expected 575000, got 1075
 <time> [ERR] HSWC: ChannelLink(<chan>): outgoing htlc(<hex>) is too small: min_htlc=<amt>, htlc_value=<amt>
+<time> [ERR] HSWC: ChannelLink(<chan>): unable to cancel incoming HTLC for circuit-key=(Chan ID=<chan>, HTLC ID=0): HTLC with ID 0 has already been failed
 <time> [ERR] HSWC: ChannelLink(<chan>): unable to decode onion hop iterator: TemporaryChannelFailure
 <time> [ERR] HSWC: ChannelLink(<chan>): unhandled error while forwarding htlc packet over htlcswitch: AmountBelowMinimum(amt=4000 mSAT, update=(lnwire.ChannelUpdate) {
 <time> [ERR] HSWC: ChannelLink(<chan>): unhandled error while forwarding htlc packet over htlcswitch: circuit has already been closed
@@ -90,6 +95,7 @@
 <time> [ERR] HSWC: ChannelLink(<chan>): Unhandled error while reforwarding htlc settle/fail over htlcswitch: insufficient bandwidth to route htlc
 <time> [ERR] HSWC: ChannelLink(<chan>): Unhandled error while reforwarding htlc settle/fail over htlcswitch: node configured to disallow forwards
 <time> [ERR] HSWC: ChannelLink(<chan>): Unhandled error while reforwarding htlc settle/fail over htlcswitch: UnknownNextPeer
+<time> [ERR] HSWC: ChannelLink(<chan>): failing link: unable to synchronize channel states: unable to send chan sync message for ChannelPoint(<chan_point>): set tcp <ip>: use of closed network connection with error: unable to resume channel, recovery required
 <time> [ERR] HSWC: FeeInsufficient(htlc_amt==<amt>, update=(lnwire.ChannelUpdate) {
 <time> [ERR] HSWC: insufficient bandwidth to route htlc
 <time> [ERR] HSWC: Link <chan> not found
@@ -123,6 +129,7 @@
 <time> [ERR] PEER: unable to get best block: the client has been shutdown
 <time> [ERR] PEER: unable to send msg to remote peer: peer exiting
 <time> [ERR] PEER: unable to send msg to remote peer: write tcp <ip>-><ip>: write: broken pipe
+<time> [ERR] PEER: unable to send msg to remote peer: write tcp <ip>-><ip>: write: connection reset by peer
 <time> [ERR] RPCS: [/invoicesrpc.Invoices/SubscribeSingleInvoice]: rpc error: code = Canceled desc = context canceled
 <time> [ERR] RPCS: [/lnrpc.Lightning/CloseChannel]: cannot co-op close frozen channel as initiator until height=<height>, (current_height=<height>)
 <time> [ERR] RPCS: [/lnrpc.Lightning/CloseChannel]: cannot co-op close frozen channel as initiator until height=3059, (current_height=3055)
@@ -152,6 +159,7 @@
 <time> [ERR] RPCS: [/lnrpc.Lightning/SubscribeChannelGraph]: rpc error: code = Internal desc = transport: transport: the stream is done or WriteHeader was already called
 <time> [ERR] RPCS: [/lnrpc.Lightning/SubscribeInvoices]: rpc error: code = Canceled desc = context canceled
 <time> [ERR] RPCS: [/routerrpc.Router/SendPayment]: routerrpc server shutting down
+<time> [ERR] RPCS: [/routerrpc.Router/SendPaymentV2]: context canceled
 <time> [ERR] RPCS: [/routerrpc.Router/SendPaymentV2]: routerrpc server shutting down
 <time> [ERR] RPCS: [/routerrpc.Router/SubscribeHtlcEvents]: context canceled
 <time> [ERR] RPCS: [/routerrpc.Router/SubscribeHtlcEvents]: htlc event subscription terminated
@@ -172,3 +180,11 @@
 <time> [ERR] UTXN: error while graduating class at height=<height>: TxNotifier is exiting
 <time> [ERR] UTXN: Failed to sweep first-stage HTLC (CLTV-delayed) output <chan_point>
 <time> [ERR] UTXN: Notification chan closed, can't advance output <chan_point>
+<time> [ERR] RPCS: [/walletrpc.WalletKit/LabelTransaction]: cannot label transaction with empty label
+<time> [ERR] RPCS: [/walletrpc.WalletKit/LabelTransaction]: transaction already labelled
+<time> [ERR] NTFN: unable to get hash from block with height 790
+<time> [ERR] CRTR: Payment with hash <hex> failed: timeout
+<time> [ERR] RPCS: [/routerrpc.Route<time> [INF] LTND: Listening on the p2p interface is disabled!
+<time> [ERR] FNDG: Unable to advance state(<chan_point>): failed adding to router graph: error sending channel announcement: gossiper is shutting down
+<time> [ERR] PEER: unable to close channel, ChannelID(<hex>) is unknown
+<time> [ERR] HSWC: ChannelLink(<chan>): unable to update signals
