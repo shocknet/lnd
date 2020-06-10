@@ -2,16 +2,15 @@ package channeldb
 
 import (
 	"crypto/rand"
+	"fmt"
 	"math"
-	"reflect"
 	"testing"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/record"
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -20,7 +19,10 @@ var (
 )
 
 func randInvoice(value lnwire.MilliSatoshi) (*Invoice, error) {
-	var pre, payAddr [32]byte
+	var (
+		pre     lntypes.Preimage
+		payAddr [32]byte
+	)
 	if _, err := rand.Read(pre[:]); err != nil {
 		return nil, err
 	}
@@ -32,7 +34,7 @@ func randInvoice(value lnwire.MilliSatoshi) (*Invoice, error) {
 		CreationDate: testNow,
 		Terms: ContractTerm{
 			Expiry:          4000,
-			PaymentPreimage: pre,
+			PaymentPreimage: &pre,
 			PaymentAddr:     payAddr,
 			Value:           value,
 			Features:        emptyFeatures,
@@ -182,10 +184,11 @@ func testInvoiceWorkflow(t *testing.T, test invWorkflowTest) {
 		}
 		return
 	}
-	if !reflect.DeepEqual(*fakeInvoice, dbInvoice) {
-		t.Fatalf("invoice fetched from db doesn't match original %v vs %v",
-			spew.Sdump(fakeInvoice), spew.Sdump(dbInvoice))
-	}
+
+	require.Equal(t,
+		*fakeInvoice, dbInvoice,
+		"invoice fetched from db doesn't match original",
+	)
 
 	// The add index of the invoice retrieved from the database should now
 	// be fully populated. As this is the first index written to the DB,
@@ -277,12 +280,75 @@ func testInvoiceWorkflow(t *testing.T, test invWorkflowTest) {
 	// order (and the primary key should be incremented with each
 	// insertion).
 	for i := 0; i < len(invoices); i++ {
-		if !reflect.DeepEqual(*invoices[i], response.Invoices[i]) {
-			t.Fatalf("retrieved invoices don't match %v vs %v",
-				spew.Sdump(invoices[i]),
-				spew.Sdump(response.Invoices[i]))
-		}
+		require.Equal(t,
+			*invoices[i], response.Invoices[i],
+			"retrieved invoice doesn't match",
+		)
 	}
+}
+
+// TestAddDuplicatePayAddr asserts that the payment addresses of inserted
+// invoices are unique.
+func TestAddDuplicatePayAddr(t *testing.T) {
+	db, cleanUp, err := makeTestDB()
+	defer cleanUp()
+	require.NoError(t, err)
+
+	// Create two invoices with the same payment addr.
+	invoice1, err := randInvoice(1000)
+	require.NoError(t, err)
+
+	invoice2, err := randInvoice(20000)
+	require.NoError(t, err)
+	invoice2.Terms.PaymentAddr = invoice1.Terms.PaymentAddr
+
+	// First insert should succeed.
+	inv1Hash := invoice1.Terms.PaymentPreimage.Hash()
+	_, err = db.AddInvoice(invoice1, inv1Hash)
+	require.NoError(t, err)
+
+	// Second insert should fail with duplicate payment addr.
+	inv2Hash := invoice2.Terms.PaymentPreimage.Hash()
+	_, err = db.AddInvoice(invoice2, inv2Hash)
+	require.Error(t, err, ErrDuplicatePayAddr)
+}
+
+// TestInvRefEquivocation asserts that retrieving or updating an invoice using
+// an equivocating InvoiceRef results in ErrInvRefEquivocation.
+func TestInvRefEquivocation(t *testing.T) {
+	db, cleanUp, err := makeTestDB()
+	defer cleanUp()
+	require.NoError(t, err)
+
+	// Add two random invoices.
+	invoice1, err := randInvoice(1000)
+	require.NoError(t, err)
+
+	inv1Hash := invoice1.Terms.PaymentPreimage.Hash()
+	_, err = db.AddInvoice(invoice1, inv1Hash)
+	require.NoError(t, err)
+
+	invoice2, err := randInvoice(2000)
+	require.NoError(t, err)
+
+	inv2Hash := invoice2.Terms.PaymentPreimage.Hash()
+	_, err = db.AddInvoice(invoice2, inv2Hash)
+	require.NoError(t, err)
+
+	// Now, query using invoice 1's payment address, but invoice 2's payment
+	// hash. We expect an error since the invref points to multiple
+	// invoices.
+	ref := InvoiceRefByHashAndAddr(inv2Hash, invoice1.Terms.PaymentAddr)
+	_, err = db.LookupInvoice(ref)
+	require.Error(t, err, ErrInvRefEquivocation)
+
+	// The same error should be returned when updating an equivocating
+	// reference.
+	nop := func(_ *Invoice) (*InvoiceUpdateDesc, error) {
+		return nil, nil
+	}
+	_, err = db.UpdateInvoice(ref, nop)
+	require.Error(t, err, ErrInvRefEquivocation)
 }
 
 // TestAddDuplicatePayAddr asserts that the payment addresses of inserted
@@ -360,13 +426,18 @@ func TestInvoiceCancelSingleHtlc(t *testing.T) {
 		t.Fatalf("unable to make test db: %v", err)
 	}
 
+	preimage := lntypes.Preimage{1}
+	paymentHash := preimage.Hash()
+
 	testInvoice := &Invoice{
 		Htlcs: map[CircuitKey]*InvoiceHTLC{},
+		Terms: ContractTerm{
+			Value:           lnwire.NewMSatFromSatoshis(10000),
+			Features:        emptyFeatures,
+			PaymentPreimage: &preimage,
+		},
 	}
-	testInvoice.Terms.Value = lnwire.NewMSatFromSatoshis(10000)
-	testInvoice.Terms.Features = emptyFeatures
 
-	var paymentHash lntypes.Hash
 	if _, err := db.AddInvoice(testInvoice, paymentHash); err != nil {
 		t.Fatalf("unable to find invoice: %v", err)
 	}
@@ -430,7 +501,7 @@ func TestInvoiceAddTimeSeries(t *testing.T) {
 	}
 
 	_, err = db.InvoicesAddedSince(0)
-	assert.Nil(t, err)
+	require.NoError(t, err)
 
 	// We'll start off by creating 20 random invoices, and inserting them
 	// into the database.
@@ -493,14 +564,18 @@ func TestInvoiceAddTimeSeries(t *testing.T) {
 			t.Fatalf("unable to query: %v", err)
 		}
 
-		if !reflect.DeepEqual(query.resp, resp) {
-			t.Fatalf("test #%v: expected %v, got %v", i,
-				spew.Sdump(query.resp), spew.Sdump(resp))
+		require.Equal(t, len(query.resp), len(resp))
+
+		for j := 0; j < len(query.resp); j++ {
+			require.Equal(t,
+				query.resp[j], resp[j],
+				fmt.Sprintf("test: #%v, item: #%v", i, j),
+			)
 		}
 	}
 
 	_, err = db.InvoicesSettledSince(0)
-	assert.Nil(t, err)
+	require.NoError(t, err)
 
 	var settledInvoices []Invoice
 	var settleIndex uint64 = 1
@@ -558,9 +633,13 @@ func TestInvoiceAddTimeSeries(t *testing.T) {
 			t.Fatalf("unable to query: %v", err)
 		}
 
-		if !reflect.DeepEqual(query.resp, resp) {
-			t.Fatalf("test #%v: expected %v, got %v", i,
-				spew.Sdump(query.resp), spew.Sdump(resp))
+		require.Equal(t, len(query.resp), len(resp))
+
+		for j := 0; j < len(query.resp); j++ {
+			require.Equal(t,
+				query.resp[j], resp[j],
+				fmt.Sprintf("test: #%v, item: #%v", i, j),
+			)
 		}
 	}
 }
@@ -646,14 +725,11 @@ func TestFetchAllInvoicesWithPaymentHash(t *testing.T) {
 				pendingInvoices[i].PaymentHash)
 		}
 
-		// Zero out add index to not confuse DeepEqual.
+		// Zero out add index to not confuse require.Equal.
 		pendingInvoices[i].Invoice.AddIndex = 0
 		expected.AddIndex = 0
 
-		if !reflect.DeepEqual(*expected, pendingInvoices[i].Invoice) {
-			t.Fatalf("expected: %v, got: %v",
-				spew.Sdump(expected), spew.Sdump(pendingInvoices[i].Invoice))
-		}
+		require.Equal(t, *expected, pendingInvoices[i].Invoice)
 	}
 
 	for i := range allInvoices {
@@ -663,14 +739,11 @@ func TestFetchAllInvoicesWithPaymentHash(t *testing.T) {
 				allInvoices[i].PaymentHash)
 		}
 
-		// Zero out add index to not confuse DeepEqual.
+		// Zero out add index to not confuse require.Equal.
 		allInvoices[i].Invoice.AddIndex = 0
 		expected.AddIndex = 0
 
-		if !reflect.DeepEqual(*expected, allInvoices[i].Invoice) {
-			t.Fatalf("expected: %v, got: %v",
-				spew.Sdump(expected), spew.Sdump(allInvoices[i].Invoice))
-		}
+		require.Equal(t, *expected, allInvoices[i].Invoice)
 	}
 
 }
@@ -724,10 +797,7 @@ func TestDuplicateSettleInvoice(t *testing.T) {
 	}
 
 	// We should get back the exact same invoice that we just inserted.
-	if !reflect.DeepEqual(dbInvoice, invoice) {
-		t.Fatalf("wrong invoice after settle, expected %v got %v",
-			spew.Sdump(invoice), spew.Sdump(dbInvoice))
-	}
+	require.Equal(t, invoice, dbInvoice, "wrong invoice after settle")
 
 	// If we try to settle the invoice again, then we should get the very
 	// same invoice back, but with an error this time.
@@ -741,10 +811,7 @@ func TestDuplicateSettleInvoice(t *testing.T) {
 	}
 
 	invoice.SettleDate = dbInvoice.SettleDate
-	if !reflect.DeepEqual(dbInvoice, invoice) {
-		t.Fatalf("wrong invoice after second settle, expected %v got %v",
-			spew.Sdump(invoice), spew.Sdump(dbInvoice))
-	}
+	require.Equal(t, invoice, dbInvoice, "wrong invoice after second settle")
 }
 
 // TestQueryInvoices ensures that we can properly query the invoice database for
@@ -1004,6 +1071,18 @@ func TestQueryInvoices(t *testing.T) {
 			// still pending.
 			expected: pendingInvoices[len(pendingInvoices)-15:],
 		},
+		// Fetch all invoices paginating backwards, with an index offset
+		// that is beyond our last offset. We expect all invoices to be
+		// returned.
+		{
+			query: InvoiceQuery{
+				IndexOffset:    numInvoices * 2,
+				PendingOnly:    false,
+				Reversed:       true,
+				NumMaxInvoices: numInvoices,
+			},
+			expected: invoices,
+		},
 	}
 
 	for i, testCase := range testCases {
@@ -1012,11 +1091,13 @@ func TestQueryInvoices(t *testing.T) {
 			t.Fatalf("unable to query invoice database: %v", err)
 		}
 
-		if !reflect.DeepEqual(response.Invoices, testCase.expected) {
-			t.Fatalf("test #%d: query returned incorrect set of "+
-				"invoices: expcted %v, got %v", i,
-				spew.Sdump(response.Invoices),
-				spew.Sdump(testCase.expected))
+		require.Equal(t, len(testCase.expected), len(response.Invoices))
+
+		for j, expected := range testCase.expected {
+			require.Equal(t,
+				expected, response.Invoices[j],
+				fmt.Sprintf("test: #%v, item: #%v", i, j),
+			)
 		}
 	}
 }
@@ -1059,15 +1140,20 @@ func TestCustomRecords(t *testing.T) {
 		t.Fatalf("unable to make test db: %v", err)
 	}
 
+	preimage := lntypes.Preimage{1}
+	paymentHash := preimage.Hash()
+
 	testInvoice := &Invoice{
 		Htlcs: map[CircuitKey]*InvoiceHTLC{},
+		Terms: ContractTerm{
+			Value:           lnwire.NewMSatFromSatoshis(10000),
+			Features:        emptyFeatures,
+			PaymentPreimage: &preimage,
+		},
 	}
-	testInvoice.Terms.Value = lnwire.NewMSatFromSatoshis(10000)
-	testInvoice.Terms.Features = emptyFeatures
 
-	var paymentHash lntypes.Hash
 	if _, err := db.AddInvoice(testInvoice, paymentHash); err != nil {
-		t.Fatalf("unable to find invoice: %v", err)
+		t.Fatalf("unable to add invoice: %v", err)
 	}
 
 	// Accept an htlc with custom records on this invoice.
@@ -1105,9 +1191,30 @@ func TestCustomRecords(t *testing.T) {
 	if len(dbInvoice.Htlcs) != 1 {
 		t.Fatalf("expected the htlc to be added")
 	}
-	if !reflect.DeepEqual(records, dbInvoice.Htlcs[key].CustomRecords) {
-		t.Fatalf("invalid custom records")
-	}
+
+	require.Equal(t,
+		records, dbInvoice.Htlcs[key].CustomRecords,
+		"invalid custom records",
+	)
+}
+
+// TestInvoiceRef asserts that the proper identifiers are returned from an
+// InvoiceRef depending on the constructor used.
+func TestInvoiceRef(t *testing.T) {
+	payHash := lntypes.Hash{0x01}
+	payAddr := [32]byte{0x02}
+
+	// An InvoiceRef by hash should return the provided hash and a nil
+	// payment addr.
+	refByHash := InvoiceRefByHash(payHash)
+	require.Equal(t, payHash, refByHash.PayHash())
+	require.Equal(t, (*[32]byte)(nil), refByHash.PayAddr())
+
+	// An InvoiceRef by hash and addr should return the payment hash and
+	// payment addr passed to the constructor.
+	refByHashAndAddr := InvoiceRefByHashAndAddr(payHash, payAddr)
+	require.Equal(t, payHash, refByHashAndAddr.PayHash())
+	require.Equal(t, &payAddr, refByHashAndAddr.PayAddr())
 }
 
 // TestInvoiceRef asserts that the proper identifiers are returned from an

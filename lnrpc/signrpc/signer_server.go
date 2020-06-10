@@ -14,6 +14,7 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnrpc"
@@ -174,6 +175,28 @@ func (s *Server) RegisterWithRootServer(grpcServer *grpc.Server) error {
 	return nil
 }
 
+// RegisterWithRestServer will be called by the root REST mux to direct a sub
+// RPC server to register itself with the main REST mux server. Until this is
+// called, each sub-server won't be able to have requests routed towards it.
+//
+// NOTE: This is part of the lnrpc.SubServer interface.
+func (s *Server) RegisterWithRestServer(ctx context.Context,
+	mux *runtime.ServeMux, dest string, opts []grpc.DialOption) error {
+
+	// We make sure that we register it with the main REST server to ensure
+	// all our methods are routed properly.
+	err := RegisterSignerHandlerFromEndpoint(ctx, mux, dest, opts)
+	if err != nil {
+		log.Errorf("Could not register Signer REST server "+
+			"with root REST server: %v", err)
+		return err
+	}
+
+	log.Debugf("Signer REST server successfully registered with " +
+		"root REST server")
+	return nil
+}
+
 // SignOutputRaw generates a signature for the passed transaction according to
 // the data within the passed SignReq. If we're unable to find the keys that
 // correspond to the KeyLocators in the SignReq then we'll return an error.
@@ -219,17 +242,17 @@ func (s *Server) SignOutputRaw(ctx context.Context, in *SignReq) (*SignResp, err
 		keyDesc := signDesc.KeyDesc
 
 		// The caller can either specify the key using the raw pubkey,
-		// or the description of the key. Below we'll feel out the
-		// oneof field to decide which one we will attempt to parse.
+		// or the description of the key. We'll still attempt to parse
+		// both if both were provided however, to ensure the underlying
+		// SignOutputRaw has as much information as possible.
 		var (
 			targetPubKey *btcec.PublicKey
 			keyLoc       keychain.KeyLocator
 		)
-		switch {
 
 		// If this method doesn't return nil, then we know that user is
 		// attempting to include a raw serialized pub key.
-		case keyDesc.GetRawKeyBytes() != nil:
+		if keyDesc.GetRawKeyBytes() != nil {
 			rawKeyBytes := keyDesc.GetRawKeyBytes()
 
 			switch {
@@ -252,10 +275,11 @@ func (s *Server) SignOutputRaw(ctx context.Context, in *SignReq) (*SignResp, err
 						"parse pubkey: %v", err)
 				}
 			}
+		}
 
-		// Similarly, if they specified a key locator, then we'll use
-		// that instead.
-		case keyDesc.GetKeyLoc() != nil:
+		// Similarly, if they specified a key locator, then we'll parse
+		// that as well.
+		if keyDesc.GetKeyLoc() != nil {
 			protoLoc := keyDesc.GetKeyLoc()
 			keyLoc = keychain.KeyLocator{
 				Family: keychain.KeyFamily(
