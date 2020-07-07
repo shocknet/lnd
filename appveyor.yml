@@ -1,6 +1,6 @@
 version: 1.0.{build}
 image: Ubuntu1804
-skip_tags: true
+skip_non_tags: true
 environment:
   GITHUB_TOKEN:
     secure: eX0omHrG+u98lJiRLG22/bIHWT/zn7YMK86CW6JcHYnYHx83hfpDytzM7qwwyMNH
