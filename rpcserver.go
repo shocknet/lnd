@@ -57,6 +57,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/macaroons"
 	"github.com/lightningnetwork/lnd/monitoring"
+	"github.com/lightningnetwork/lnd/peer"
 	"github.com/lightningnetwork/lnd/peernotifier"
 	"github.com/lightningnetwork/lnd/record"
 	"github.com/lightningnetwork/lnd/routing"
@@ -258,6 +259,10 @@ func mainRPCServerPermissions() map[string][]bakery.Op {
 			Action: "write",
 		}},
 		"/lnrpc.Lightning/GetInfo": {{
+			Entity: "info",
+			Action: "read",
+		}},
+		"/lnrpc.Lightning/GetRecoveryInfo": {{
 			Entity: "info",
 			Action: "read",
 		}},
@@ -549,13 +554,14 @@ func newRPCServer(cfg *Config, s *server, macService *macaroons.Service,
 
 			return info.NodeKey1Bytes, info.NodeKey2Bytes, nil
 		},
-		FindRoute:             s.chanRouter.FindRoute,
-		MissionControl:        s.missionControl,
-		ActiveNetParams:       activeNetParams.Params,
-		Tower:                 s.controlTower,
-		MaxTotalTimelock:      cfg.MaxOutgoingCltvExpiry,
-		DefaultFinalCltvDelta: uint16(cfg.Bitcoin.TimeLockDelta),
-		SubscribeHtlcEvents:   s.htlcNotifier.SubscribeHtlcEvents,
+		FindRoute:              s.chanRouter.FindRoute,
+		MissionControl:         s.missionControl,
+		ActiveNetParams:        activeNetParams.Params,
+		Tower:                  s.controlTower,
+		MaxTotalTimelock:       cfg.MaxOutgoingCltvExpiry,
+		DefaultFinalCltvDelta:  uint16(cfg.Bitcoin.TimeLockDelta),
+		SubscribeHtlcEvents:    s.htlcNotifier.SubscribeHtlcEvents,
+		InterceptableForwarder: s.interceptableSwitch,
 	}
 
 	genInvoiceFeatures := func() *lnwire.FeatureVector {
@@ -799,6 +805,15 @@ func (r *rpcServer) Start() error {
 	restCtx, restCancel := context.WithCancel(context.Background())
 	r.listenerCleanUp = append(r.listenerCleanUp, restCancel)
 
+	// Wrap the default grpc-gateway handler with the WebSocket handler.
+	restHandler := lnrpc.NewWebSocketProxy(restMux, rpcsLog)
+
+	// Set the CORS headers if configured. This wraps the HTTP handler with
+	// another handler.
+	if len(r.cfg.RestCORS) > 0 {
+		restHandler = allowCORS(restHandler, r.cfg.RestCORS)
+	}
+
 	// With our custom REST proxy mux created, register our main RPC and
 	// give all subservers a chance to register as well.
 	err := lnrpc.RegisterLightningHandlerFromEndpoint(
@@ -849,7 +864,15 @@ func (r *rpcServer) Start() error {
 
 		go func() {
 			rpcsLog.Infof("gRPC proxy started at %s", lis.Addr())
-			_ = http.Serve(lis, restMux)
+
+			// Create our proxy chain now. A request will pass
+			// through the following chain:
+			// req ---> CORS handler --> WS proxy --->
+			//   REST proxy --> gRPC endpoint
+			err := http.Serve(lis, restHandler)
+			if err != nil && !lnrpc.IsClosedConnError(err) {
+				rpcsLog.Error(err)
+			}
 		}()
 	}
 
@@ -910,6 +933,52 @@ func addrPairsToOutputs(addrPairs map[string]int64) ([]*wire.TxOut, error) {
 	}
 
 	return outputs, nil
+}
+
+// allowCORS wraps the given http.Handler with a function that adds the
+// Access-Control-Allow-Origin header to the response.
+func allowCORS(handler http.Handler, origins []string) http.Handler {
+	allowHeaders := "Access-Control-Allow-Headers"
+	allowMethods := "Access-Control-Allow-Methods"
+	allowOrigin := "Access-Control-Allow-Origin"
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+
+		// Skip everything if the browser doesn't send the Origin field.
+		if origin == "" {
+			handler.ServeHTTP(w, r)
+			return
+		}
+
+		// Set the static header fields first.
+		w.Header().Set(
+			allowHeaders,
+			"Content-Type, Accept, Grpc-Metadata-Macaroon",
+		)
+		w.Header().Set(allowMethods, "GET, POST, DELETE")
+
+		// Either we allow all origins or the incoming request matches
+		// a specific origin in our list of allowed origins.
+		for _, allowedOrigin := range origins {
+			if allowedOrigin == "*" || origin == allowedOrigin {
+				// Only set allowed origin to requested origin.
+				w.Header().Set(allowOrigin, origin)
+
+				break
+			}
+		}
+
+		// For a pre-flight request we only need to send the headers
+		// back. No need to call the rest of the chain.
+		if r.Method == "OPTIONS" {
+			return
+		}
+
+		// Everything's prepared now, we can pass the request along the
+		// chain of handlers.
+		handler.ServeHTTP(w, r)
+	})
 }
 
 // sendCoinsOnChain makes an on-chain transaction in or to send coins to one or
@@ -1642,6 +1711,7 @@ func (r *rpcServer) parseOpenChannelReq(in *lnrpc.OpenChannelRequest,
 	remoteInitialBalance := btcutil.Amount(in.PushSat)
 	minHtlcIn := lnwire.MilliSatoshi(in.MinHtlcMsat)
 	remoteCsvDelay := uint16(in.RemoteCsvDelay)
+	maxValue := lnwire.MilliSatoshi(in.RemoteMaxValueInFlightMsat)
 
 	// Ensure that the initial balance of the remote party (if pushing
 	// satoshis) does not exceed the amount the local party has requested
@@ -1744,16 +1814,17 @@ func (r *rpcServer) parseOpenChannelReq(in *lnrpc.OpenChannelRequest,
 	// open a new channel. A stream is returned in place, this stream will
 	// be used to consume updates of the state of the pending channel.
 	return &openChanReq{
-		targetPubkey:    nodePubKey,
-		chainHash:       *activeNetParams.GenesisHash,
-		localFundingAmt: localFundingAmt,
-		pushAmt:         lnwire.NewMSatFromSatoshis(remoteInitialBalance),
-		minHtlcIn:       minHtlcIn,
-		fundingFeePerKw: feeRate,
-		private:         in.Private,
-		remoteCsvDelay:  remoteCsvDelay,
-		minConfs:        minConfs,
-		shutdownScript:  script,
+		targetPubkey:     nodePubKey,
+		chainHash:        *activeNetParams.GenesisHash,
+		localFundingAmt:  localFundingAmt,
+		pushAmt:          lnwire.NewMSatFromSatoshis(remoteInitialBalance),
+		minHtlcIn:        minHtlcIn,
+		fundingFeePerKw:  feeRate,
+		private:          in.Private,
+		remoteCsvDelay:   remoteCsvDelay,
+		minConfs:         minConfs,
+		shutdownScript:   script,
+		maxValueInFlight: maxValue,
 	}, nil
 }
 
@@ -2037,31 +2108,36 @@ func (r *rpcServer) CloseChannel(in *lnrpc.CloseChannelRequest,
 		// With the transaction broadcast, we send our first update to
 		// the client.
 		updateChan = make(chan interface{}, 2)
-		updateChan <- &pendingUpdate{
+		updateChan <- &peer.PendingUpdate{
 			Txid: closingTxid[:],
 		}
 
 		errChan = make(chan error, 1)
 		notifier := r.server.cc.chainNotifier
-		go waitForChanToClose(uint32(bestHeight), notifier, errChan, chanPoint,
+		go peer.WaitForChanToClose(uint32(bestHeight), notifier, errChan, chanPoint,
 			&closingTxid, closingTx.TxOut[0].PkScript, func() {
 				// Respond to the local subsystem which
 				// requested the channel closure.
-				updateChan <- &channelCloseUpdate{
+				updateChan <- &peer.ChannelCloseUpdate{
 					ClosingTxid: closingTxid[:],
 					Success:     true,
 				}
 			})
 	} else {
 		// If this is a frozen channel, then we only allow the co-op
-		// close to proceed if we were the responder to this channel.
-		if channel.ChanType.IsFrozen() && channel.IsInitiator &&
-			uint32(bestHeight) < channel.ThawHeight {
-
-			return fmt.Errorf("cannot co-op close frozen channel "+
-				"as initiator until height=%v, "+
-				"(current_height=%v)", channel.ThawHeight,
-				bestHeight)
+		// close to proceed if we were the responder to this channel if
+		// the absolute thaw height has not been met.
+		if channel.IsInitiator {
+			absoluteThawHeight, err := channel.AbsoluteThawHeight()
+			if err != nil {
+				return err
+			}
+			if uint32(bestHeight) < absoluteThawHeight {
+				return fmt.Errorf("cannot co-op close frozen "+
+					"channel as initiator until height=%v, "+
+					"(current_height=%v)",
+					absoluteThawHeight, bestHeight)
+			}
 		}
 
 		// If the link is not known by the switch, we cannot gracefully close
@@ -2155,7 +2231,7 @@ out:
 			// then we can break out of our dispatch loop as we no
 			// longer need to process any further updates.
 			switch closeUpdate := closingUpdate.(type) {
-			case *channelCloseUpdate:
+			case *peer.ChannelCloseUpdate:
 				h, _ := chainhash.NewHash(closeUpdate.ClosingTxid)
 				rpcsLog.Infof("[closechannel] close completed: "+
 					"txid(%v)", h)
@@ -2173,7 +2249,7 @@ func createRPCCloseUpdate(update interface{}) (
 	*lnrpc.CloseStatusUpdate, error) {
 
 	switch u := update.(type) {
-	case *channelCloseUpdate:
+	case *peer.ChannelCloseUpdate:
 		return &lnrpc.CloseStatusUpdate{
 			Update: &lnrpc.CloseStatusUpdate_ChanClose{
 				ChanClose: &lnrpc.ChannelCloseUpdate{
@@ -2181,7 +2257,7 @@ func createRPCCloseUpdate(update interface{}) (
 				},
 			},
 		}, nil
-	case *pendingUpdate:
+	case *peer.PendingUpdate:
 		return &lnrpc.CloseStatusUpdate{
 			Update: &lnrpc.CloseStatusUpdate_ClosePending{
 				ClosePending: &lnrpc.PendingUpdate{
@@ -2417,6 +2493,27 @@ func (r *rpcServer) GetInfo(ctx context.Context,
 	}, nil
 }
 
+// GetRecoveryInfo returns a boolean indicating whether the wallet is started
+// in recovery mode, whether the recovery is finished, and the progress made
+// so far.
+func (r *rpcServer) GetRecoveryInfo(ctx context.Context,
+	in *lnrpc.GetRecoveryInfoRequest) (*lnrpc.GetRecoveryInfoResponse, error) {
+
+	isRecoveryMode, progress, err := r.server.cc.wallet.GetRecoveryInfo()
+	if err != nil {
+		return nil, fmt.Errorf("unable to get wallet recovery info: %v", err)
+	}
+
+	rpcsLog.Debugf("[getrecoveryinfo] is recovery mode=%v, progress=%v",
+		isRecoveryMode, progress)
+
+	return &lnrpc.GetRecoveryInfoResponse{
+		RecoveryMode:     isRecoveryMode,
+		RecoveryFinished: progress == 1,
+		Progress:         progress,
+	}, nil
+}
+
 // ListPeers returns a verbose listing of all currently active peers.
 func (r *rpcServer) ListPeers(ctx context.Context,
 	in *lnrpc.ListPeersRequest) (*lnrpc.ListPeersResponse, error) {
@@ -2477,12 +2574,12 @@ func (r *rpcServer) ListPeers(ctx context.Context,
 			serverPeer.RemoteFeatures(),
 		)
 
-		peer := &lnrpc.Peer{
+		rpcPeer := &lnrpc.Peer{
 			PubKey:    hex.EncodeToString(nodePub[:]),
-			Address:   serverPeer.conn.RemoteAddr().String(),
-			Inbound:   serverPeer.inbound,
-			BytesRecv: atomic.LoadUint64(&serverPeer.bytesReceived),
-			BytesSent: atomic.LoadUint64(&serverPeer.bytesSent),
+			Address:   serverPeer.Conn().RemoteAddr().String(),
+			Inbound:   serverPeer.Inbound(),
+			BytesRecv: serverPeer.BytesReceived(),
+			BytesSent: serverPeer.BytesSent(),
 			SatSent:   satSent,
 			SatRecv:   satRecv,
 			PingTime:  serverPeer.PingTime(),
@@ -2497,27 +2594,27 @@ func (r *rpcServer) ListPeers(ctx context.Context,
 		// it is non-nil. If we want all the stored errors, simply
 		// add the full list to our set of errors.
 		if in.LatestError {
-			latestErr := serverPeer.errorBuffer.Latest()
+			latestErr := serverPeer.ErrorBuffer().Latest()
 			if latestErr != nil {
 				peerErrors = []interface{}{latestErr}
 			}
 		} else {
-			peerErrors = serverPeer.errorBuffer.List()
+			peerErrors = serverPeer.ErrorBuffer().List()
 		}
 
 		// Add the relevant peer errors to our response.
 		for _, error := range peerErrors {
-			tsError := error.(*timestampedError)
+			tsError := error.(*peer.TimestampedError)
 
 			rpcErr := &lnrpc.TimestampedError{
-				Timestamp: uint64(tsError.timestamp.Unix()),
-				Error:     tsError.error.Error(),
+				Timestamp: uint64(tsError.Timestamp.Unix()),
+				Error:     tsError.Error.Error(),
 			}
 
-			peer.Errors = append(peer.Errors, rpcErr)
+			rpcPeer.Errors = append(rpcPeer.Errors, rpcErr)
 		}
 
-		resp.Peers = append(resp.Peers, peer)
+		resp.Peers = append(resp.Peers, rpcPeer)
 	}
 
 	rpcsLog.Debugf("[listpeers] yielded %v peers", serverPeers)
@@ -3206,6 +3303,21 @@ func rpcCommitmentType(chanType channeldb.ChannelType) lnrpc.CommitmentType {
 	return lnrpc.CommitmentType_LEGACY
 }
 
+// createChannelConstraint creates a *lnrpc.ChannelConstraints using the
+// *Channeldb.ChannelConfig.
+func createChannelConstraint(
+	chanCfg *channeldb.ChannelConfig) *lnrpc.ChannelConstraints {
+
+	return &lnrpc.ChannelConstraints{
+		CsvDelay:          uint32(chanCfg.CsvDelay),
+		ChanReserveSat:    uint64(chanCfg.ChanReserve),
+		DustLimitSat:      uint64(chanCfg.DustLimit),
+		MaxPendingAmtMsat: uint64(chanCfg.MaxPendingAmount),
+		MinHtlcMsat:       uint64(chanCfg.MinHTLC),
+		MaxAcceptedHtlcs:  uint32(chanCfg.MaxAcceptedHtlcs),
+	}
+}
+
 // createRPCOpenChannel creates an *lnrpc.Channel from the *channeldb.Channel.
 func createRPCOpenChannel(r *rpcServer, graph *channeldb.ChannelGraph,
 	dbChannel *channeldb.OpenChannel, isActive bool) (*lnrpc.Channel, error) {
@@ -3262,14 +3374,21 @@ func createRPCOpenChannel(r *rpcServer, graph *channeldb.ChannelGraph,
 		TotalSatoshisReceived: int64(dbChannel.TotalMSatReceived.ToSatoshis()),
 		NumUpdates:            localCommit.CommitHeight,
 		PendingHtlcs:          make([]*lnrpc.HTLC, len(localCommit.Htlcs)),
-		CsvDelay:              uint32(dbChannel.LocalChanCfg.CsvDelay),
 		Initiator:             dbChannel.IsInitiator,
 		ChanStatusFlags:       dbChannel.ChanStatus().String(),
-		LocalChanReserveSat:   int64(dbChannel.LocalChanCfg.ChanReserve),
-		RemoteChanReserveSat:  int64(dbChannel.RemoteChanCfg.ChanReserve),
 		StaticRemoteKey:       commitmentType == lnrpc.CommitmentType_STATIC_REMOTE_KEY,
 		CommitmentType:        commitmentType,
 		ThawHeight:            dbChannel.ThawHeight,
+		LocalConstraints: createChannelConstraint(
+			&dbChannel.LocalChanCfg,
+		),
+		RemoteConstraints: createChannelConstraint(
+			&dbChannel.RemoteChanCfg,
+		),
+		// TODO: remove the following deprecated fields
+		CsvDelay:             uint32(dbChannel.LocalChanCfg.CsvDelay),
+		LocalChanReserveSat:  int64(dbChannel.LocalChanCfg.ChanReserve),
+		RemoteChanReserveSat: int64(dbChannel.RemoteChanCfg.ChanReserve),
 	}
 
 	for i, htlc := range localCommit.Htlcs {
@@ -3409,7 +3528,7 @@ func (r *rpcServer) createRPCClosedChannel(
 		closeType = lnrpc.ChannelCloseSummary_ABANDONED
 	}
 
-	return &lnrpc.ChannelCloseSummary{
+	channel := &lnrpc.ChannelCloseSummary{
 		Capacity:          int64(dbChannel.Capacity),
 		RemotePubkey:      nodeID,
 		CloseHeight:       dbChannel.CloseHeight,
@@ -3422,7 +3541,95 @@ func (r *rpcServer) createRPCClosedChannel(
 		ClosingTxHash:     dbChannel.ClosingTXID.String(),
 		OpenInitiator:     openInit,
 		CloseInitiator:    closeInitiator,
-	}, nil
+	}
+
+	reports, err := r.server.chanDB.FetchChannelReports(
+		*activeNetParams.GenesisHash, &dbChannel.ChanPoint,
+	)
+	switch err {
+	// If the channel does not have its resolver outcomes stored,
+	// ignore it.
+	case channeldb.ErrNoChainHashBucket:
+		fallthrough
+	case channeldb.ErrNoChannelSummaries:
+		return channel, nil
+
+	// If there is no error, fallthrough the switch to process reports.
+	case nil:
+
+	// If another error occurred, return it.
+	default:
+		return nil, err
+	}
+
+	for _, report := range reports {
+		rpcResolution, err := rpcChannelResolution(report)
+		if err != nil {
+			return nil, err
+		}
+
+		channel.Resolutions = append(channel.Resolutions, rpcResolution)
+	}
+
+	return channel, nil
+}
+
+func rpcChannelResolution(report *channeldb.ResolverReport) (*lnrpc.Resolution,
+	error) {
+
+	res := &lnrpc.Resolution{
+		AmountSat: uint64(report.Amount),
+		Outpoint: &lnrpc.OutPoint{
+			OutputIndex: report.OutPoint.Index,
+			TxidStr:     report.OutPoint.Hash.String(),
+			TxidBytes:   report.OutPoint.Hash[:],
+		},
+	}
+
+	if report.SpendTxID != nil {
+		res.SweepTxid = report.SpendTxID.String()
+	}
+
+	switch report.ResolverType {
+	case channeldb.ResolverTypeAnchor:
+		res.ResolutionType = lnrpc.ResolutionType_ANCHOR
+
+	case channeldb.ResolverTypeIncomingHtlc:
+		res.ResolutionType = lnrpc.ResolutionType_INCOMING_HTLC
+
+	case channeldb.ResolverTypeOutgoingHtlc:
+		res.ResolutionType = lnrpc.ResolutionType_OUTGOING_HTLC
+
+	case channeldb.ResolverTypeCommit:
+		res.ResolutionType = lnrpc.ResolutionType_COMMIT
+
+	default:
+		return nil, fmt.Errorf("unknown resolver type: %v",
+			report.ResolverType)
+	}
+
+	switch report.ResolverOutcome {
+	case channeldb.ResolverOutcomeClaimed:
+		res.Outcome = lnrpc.ResolutionOutcome_CLAIMED
+
+	case channeldb.ResolverOutcomeUnclaimed:
+		res.Outcome = lnrpc.ResolutionOutcome_UNCLAIMED
+
+	case channeldb.ResolverOutcomeAbandoned:
+		res.Outcome = lnrpc.ResolutionOutcome_ABANDONED
+
+	case channeldb.ResolverOutcomeFirstStage:
+		res.Outcome = lnrpc.ResolutionOutcome_FIRST_STAGE
+
+	case channeldb.ResolverOutcomeTimeout:
+		res.Outcome = lnrpc.ResolutionOutcome_TIMEOUT
+
+	default:
+		return nil, fmt.Errorf("unknown outcome: %v",
+			report.ResolverOutcome)
+	}
+
+	return res, nil
 }
 
 // getInitiators returns an initiator enum that provides information about the

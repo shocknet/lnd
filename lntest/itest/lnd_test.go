@@ -46,9 +46,11 @@ import (
 	"github.com/lightningnetwork/lnd/lntest"
 	"github.com/lightningnetwork/lnd/lntest/wait"
 	"github.com/lightningnetwork/lnd/lntypes"
+	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/chainfee"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing"
+	"github.com/stretchr/testify/require"
 )
 
 var (
@@ -816,6 +818,105 @@ const (
 	AddrTypeWitnessPubkeyHash = lnrpc.AddressType_WITNESS_PUBKEY_HASH
 	AddrTypeNestedPubkeyHash  = lnrpc.AddressType_NESTED_PUBKEY_HASH
 )
+
+// testGetRecoveryInfo checks whether lnd gives the right information about
+// the wallet recovery process.
+func testGetRecoveryInfo(net *lntest.NetworkHarness, t *harnessTest) {
+	ctxb := context.Background()
+
+	// First, create a new node with strong passphrase and grab the mnemonic
+	// used for key derivation. This will bring up Carol with an empty
+	// wallet, and such that she is synced up.
+	password := []byte("The Magic Words are Squeamish Ossifrage")
+	carol, mnemonic, err := net.NewNodeWithSeed("Carol", nil, password)
+	if err != nil {
+		t.Fatalf("unable to create node with seed; %v", err)
+	}
+
+	shutdownAndAssert(net, t, carol)
+
+	checkInfo := func(expectedRecoveryMode, expectedRecoveryFinished bool,
+		expectedProgress float64, recoveryWindow int32) {
+
+		// Restore Carol, passing in the password, mnemonic, and
+		// desired recovery window.
+		node, err := net.RestoreNodeWithSeed(
+			"Carol", nil, password, mnemonic, recoveryWindow, nil,
+		)
+		if err != nil {
+			t.Fatalf("unable to restore node: %v", err)
+		}
+
+		// Wait for Carol to sync to the chain.
+		_, minerHeight, err := net.Miner.Node.GetBestBlock()
+		if err != nil {
+			t.Fatalf("unable to get current blockheight %v", err)
+		}
+		ctxt, _ := context.WithTimeout(ctxb, defaultTimeout)
+		err = waitForNodeBlockHeight(ctxt, node, minerHeight)
+		if err != nil {
+			t.Fatalf("unable to sync to chain: %v", err)
+		}
+
+		// Query carol for her current wallet recovery progress.
+		var (
+			recoveryMode     bool
+			recoveryFinished bool
+			progress         float64
+		)
+
+		err = wait.Predicate(func() bool {
+			// Verify that recovery info gives the right response.
+			req := &lnrpc.GetRecoveryInfoRequest{}
+			ctxt, _ := context.WithTimeout(ctxb, defaultTimeout)
+			resp, err := node.GetRecoveryInfo(ctxt, req)
+			if err != nil {
+				t.Fatalf("unable to query recovery info: %v", err)
+			}
+
+			recoveryMode = resp.RecoveryMode
+			recoveryFinished = resp.RecoveryFinished
+			progress = resp.Progress
+
+			if recoveryMode != expectedRecoveryMode ||
+				recoveryFinished != expectedRecoveryFinished ||
+				progress != expectedProgress {
+				return false
+			}
+
+			return true
+		}, 15*time.Second)
+		if err != nil {
+			t.Fatalf("expected recovery mode to be %v, got %v, "+
+				"expected recovery finished to be %v, got %v, "+
+				"expected progress %v, got %v",
+				expectedRecoveryMode, recoveryMode,
+				expectedRecoveryFinished, recoveryFinished,
+				expectedProgress, progress,
+			)
+		}
+
+		// Lastly, shutdown this Carol so we can move on to the next
+		// restoration.
+		shutdownAndAssert(net, t, node)
+	}
+
+	// Restore Carol with a recovery window of 0. Since it's not in recovery
+	// mode, the recovery info will give a response with recoveryMode=false,
+	// recoveryFinished=false, and progress=0
+	checkInfo(false, false, 0, 0)
+
+	// Change the recovery windown to be 1 to turn on recovery mode. Since the
+	// current chain height is the same as the birthday height, it should
+	// indicate the recovery process is finished.
+	checkInfo(true, true, 1, 1)
+
+	// We now go ahead 5 blocks. Because the wallet's syncing process is
+	// controlled by a goroutine in the background, it will catch up quickly.
+	// This makes the recovery progress back to 1.
+	mineBlocks(t, net, 5, 0)
+	checkInfo(true, true, 1, 1)
+}
 
 // testOnchainFundRecovery checks lnd's ability to rescan for onchain outputs
 // when providing a valid aezeed that owns outputs on the chain. This test
@@ -2578,7 +2679,7 @@ func testDisconnectingTargetPeer(net *lntest.NetworkHarness, t *harnessTest) {
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
 	err = net.SendCoins(ctxt, btcutil.SatoshiPerBitcoin, alice)
 	if err != nil {
-		t.Fatalf("unable to send coins to carol: %v", err)
+		t.Fatalf("unable to send coins to alice: %v", err)
 	}
 
 	chanAmt := lnd.MaxBtcFundingAmount
@@ -3412,6 +3513,13 @@ func channelForceClosureTest(net *lntest.NetworkHarness, t *harnessTest,
 		t.Fatalf("all funds should still be in limbo")
 	}
 
+	// Create a map of outpoints to expected resolutions for alice and carol
+	// which we will add reports to as we sweep outputs.
+	var (
+		aliceReports = make(map[string]*lnrpc.Resolution)
+		carolReports = make(map[string]*lnrpc.Resolution)
+	)
+
 	// The several restarts in this test are intended to ensure that when a
 	// channel is force-closed, the UTXO nursery has persisted the state of
 	// the channel in the closure process and will recover the correct state
@@ -3430,11 +3538,34 @@ func channelForceClosureTest(net *lntest.NetworkHarness, t *harnessTest,
 		expectedTxes = 2
 	}
 
-	_, err = waitForNTxsInMempool(
+	sweepTxns, err := waitForNTxsInMempool(
 		net.Miner.Node, expectedTxes, minerMempoolTimeout,
 	)
 	if err != nil {
 		t.Fatalf("failed to find commitment in miner mempool: %v", err)
+	}
+
+	// Find alice's commit sweep and anchor sweep (if present) in the
+	// mempool.
+	aliceCloseTx := waitingClose.Commitments.LocalTxid
+	_, aliceAnchor := findCommitAndAnchor(
+		t, net, sweepTxns, aliceCloseTx,
+	)
+
+	// If we expect anchors, add alice's anchor to our expected set of
+	// reports.
+	if channelType == commitTypeAnchors {
+		aliceReports[aliceAnchor.OutPoint.String()] = &lnrpc.Resolution{
+			ResolutionType: lnrpc.ResolutionType_ANCHOR,
+			Outcome:        lnrpc.ResolutionOutcome_CLAIMED,
+			SweepTxid:      aliceAnchor.SweepTx,
+			Outpoint: &lnrpc.OutPoint{
+				TxidBytes:   aliceAnchor.OutPoint.Hash[:],
+				TxidStr:     aliceAnchor.OutPoint.Hash.String(),
+				OutputIndex: aliceAnchor.OutPoint.Index,
+			},
+			AmountSat: uint64(anchorSize),
+		}
 	}
 
 	if _, err := net.Miner.Node.Generate(1); err != nil {
@@ -3505,12 +3636,33 @@ func channelForceClosureTest(net *lntest.NetworkHarness, t *harnessTest,
 	// Carol's sweep tx should be in the mempool already, as her output is
 	// not timelocked. If there are anchors, we also expect Carol's anchor
 	// sweep now.
-	_, err = waitForNTxsInMempool(
+	sweepTxns, err = waitForNTxsInMempool(
 		net.Miner.Node, expectedTxes, minerMempoolTimeout,
 	)
 	if err != nil {
 		t.Fatalf("failed to find Carol's sweep in miner mempool: %v",
 			err)
+	}
+
+	// We look up the sweep txns we have found in mempool and create
+	// expected resolutions for carol.
+	carolCommit, carolAnchor := findCommitAndAnchor(
+		t, net, sweepTxns, aliceCloseTx,
+	)
+
+	// If we have anchors, add an anchor resolution for carol.
+	if channelType == commitTypeAnchors {
+		carolReports[carolAnchor.OutPoint.String()] = &lnrpc.Resolution{
+			ResolutionType: lnrpc.ResolutionType_ANCHOR,
+			Outcome:        lnrpc.ResolutionOutcome_CLAIMED,
+			SweepTxid:      carolAnchor.SweepTx,
+			AmountSat:      anchorSize,
+			Outpoint: &lnrpc.OutPoint{
+				TxidBytes:   carolAnchor.OutPoint.Hash[:],
+				TxidStr:     carolAnchor.OutPoint.Hash.String(),
+				OutputIndex: carolAnchor.OutPoint.Index,
+			},
+		}
 	}
 
 	// Currently within the codebase, the default CSV is 4 relative blocks.
@@ -3530,6 +3682,7 @@ func channelForceClosureTest(net *lntest.NetworkHarness, t *harnessTest,
 
 	// Alice should see the channel in her set of pending force closed
 	// channels with her funds still in limbo.
+	var aliceBalance int64
 	err = wait.NoError(func() error {
 		ctxt, _ := context.WithTimeout(ctxb, defaultTimeout)
 		pendingChanResp, err := alice.PendingChannels(
@@ -3551,6 +3704,9 @@ func channelForceClosureTest(net *lntest.NetworkHarness, t *harnessTest,
 		if err != nil {
 			return err
 		}
+
+		// Make a record of the balances we expect for alice and carol.
+		aliceBalance = forceClose.Channel.LocalBalance
 
 		// At this point, the nursery should show that the commitment
 		// output has 2 block left before its CSV delay expires. In
@@ -3610,6 +3766,32 @@ func channelForceClosureTest(net *lntest.NetworkHarness, t *harnessTest,
 				"tx %v, instead spending %v",
 				closingTxID, txIn.PreviousOutPoint)
 		}
+	}
+
+	// We expect a resolution which spends our commit output.
+	output := sweepTx.MsgTx().TxIn[0].PreviousOutPoint
+	aliceReports[output.String()] = &lnrpc.Resolution{
+		ResolutionType: lnrpc.ResolutionType_COMMIT,
+		Outcome:        lnrpc.ResolutionOutcome_CLAIMED,
+		SweepTxid:      sweepingTXID.String(),
+		Outpoint: &lnrpc.OutPoint{
+			TxidBytes:   output.Hash[:],
+			TxidStr:     output.Hash.String(),
+			OutputIndex: output.Index,
+		},
+		AmountSat: uint64(aliceBalance),
+	}
+
+	carolReports[carolCommit.OutPoint.String()] = &lnrpc.Resolution{
+		ResolutionType: lnrpc.ResolutionType_COMMIT,
+		Outcome:        lnrpc.ResolutionOutcome_CLAIMED,
+		Outpoint: &lnrpc.OutPoint{
+			TxidBytes:   carolCommit.OutPoint.Hash[:],
+			TxidStr:     carolCommit.OutPoint.Hash.String(),
+			OutputIndex: carolCommit.OutPoint.Index,
+		},
+		AmountSat: uint64(pushAmt),
+		SweepTxid: carolCommit.SweepTx,
 	}
 
 	// Check that we can find the commitment sweep in our set of known
@@ -3790,6 +3972,7 @@ func channelForceClosureTest(net *lntest.NetworkHarness, t *harnessTest,
 	// the sweeper check for these timeout transactions because they are
 	// not swept by the sweeper; the nursery broadcasts the pre-signed
 	// transaction.
+	var htlcLessFees uint64
 	for _, htlcTxID := range htlcTxIDs {
 		// Fetch the sweep transaction, all input it's spending should
 		// be from the commitment transaction which was broadcast
@@ -3799,18 +3982,62 @@ func channelForceClosureTest(net *lntest.NetworkHarness, t *harnessTest,
 			t.Fatalf("unable to fetch sweep tx: %v", err)
 		}
 		// Ensure the htlc transaction only has one input.
-		if len(htlcTx.MsgTx().TxIn) != 1 {
+		inputs := htlcTx.MsgTx().TxIn
+		if len(inputs) != 1 {
 			t.Fatalf("htlc transaction should only have one txin, "+
 				"has %d", len(htlcTx.MsgTx().TxIn))
 		}
 		// Ensure the htlc transaction is spending from the commitment
 		// transaction.
-		txIn := htlcTx.MsgTx().TxIn[0]
+		txIn := inputs[0]
 		if !closingTxID.IsEqual(&txIn.PreviousOutPoint.Hash) {
 			t.Fatalf("htlc transaction not spending from commit "+
 				"tx %v, instead spending %v",
 				closingTxID, txIn.PreviousOutPoint)
 		}
+
+		outputs := htlcTx.MsgTx().TxOut
+		if len(outputs) != 1 {
+			t.Fatalf("htlc transaction should only have one "+
+				"txout, has: %v", len(outputs))
+		}
+
+		// For each htlc timeout transaction, we expect a resolver
+		// report recording this on chain resolution for both alice and
+		// carol.
+		outpoint := txIn.PreviousOutPoint
+		resolutionOutpoint := &lnrpc.OutPoint{
+			TxidBytes:   outpoint.Hash[:],
+			TxidStr:     outpoint.Hash.String(),
+			OutputIndex: outpoint.Index,
+		}
+
+		// We expect alice to have a timeout tx resolution with an
+		// amount equal to the payment amount.
+		aliceReports[outpoint.String()] = &lnrpc.Resolution{
+			ResolutionType: lnrpc.ResolutionType_OUTGOING_HTLC,
+			Outcome:        lnrpc.ResolutionOutcome_FIRST_STAGE,
+			SweepTxid:      htlcTx.Hash().String(),
+			Outpoint:       resolutionOutpoint,
+			AmountSat:      uint64(paymentAmt),
+		}
+
+		// We expect carol to have a resolution with an incoming htlc
+		// timeout which reflects the full amount of the htlc. It has
+		// no spend tx, because carol stops monitoring the htlc once
+		// it has timed out.
+		carolReports[outpoint.String()] = &lnrpc.Resolution{
+			ResolutionType: lnrpc.ResolutionType_INCOMING_HTLC,
+			Outcome:        lnrpc.ResolutionOutcome_TIMEOUT,
+			SweepTxid:      "",
+			Outpoint:       resolutionOutpoint,
+			AmountSat:      uint64(paymentAmt),
+		}
+
+		// We record the htlc amount less fees here, so that we know
+		// what value to expect for the second stage of our htlc
+		// htlc resolution.
+		htlcLessFees = uint64(outputs[0].Value)
 	}
 
 	// With the htlc timeout txns still in the mempool, we restart Alice to
@@ -3922,6 +4149,12 @@ func channelForceClosureTest(net *lntest.NetworkHarness, t *harnessTest,
 		t.Fatalf("htlc transaction should have %d txin, "+
 			"has %d", numInvoices, len(htlcSweepTx.MsgTx().TxIn))
 	}
+	outputCount := len(htlcSweepTx.MsgTx().TxOut)
+	if outputCount != 1 {
+		t.Fatalf("htlc sweep transaction should have one output, has: "+
+			"%v", outputCount)
+	}
+
 	// Ensure that each output spends from exactly one htlc timeout txn.
 	for _, txIn := range htlcSweepTx.MsgTx().TxIn {
 		outpoint := txIn.PreviousOutPoint.Hash
@@ -3937,6 +4170,21 @@ func channelForceClosureTest(net *lntest.NetworkHarness, t *harnessTest,
 		if htlcTxIDSet[outpoint] > 1 {
 			t.Fatalf("htlc sweep tx has multiple spends from "+
 				"outpoint %v", outpoint)
+		}
+
+		// Since we have now swept our htlc timeout tx, we expect to
+		// have timeout resolutions for each of our htlcs.
+		output := txIn.PreviousOutPoint
+		aliceReports[output.String()] = &lnrpc.Resolution{
+			ResolutionType: lnrpc.ResolutionType_OUTGOING_HTLC,
+			Outcome:        lnrpc.ResolutionOutcome_TIMEOUT,
+			SweepTxid:      htlcSweepTx.Hash().String(),
+			Outpoint: &lnrpc.OutPoint{
+				TxidBytes:   output.Hash[:],
+				TxidStr:     output.Hash.String(),
+				OutputIndex: output.Index,
+			},
+			AmountSat: uint64(htlcLessFees),
 		}
 	}
 
@@ -4049,6 +4297,96 @@ func channelForceClosureTest(net *lntest.NetworkHarness, t *harnessTest,
 		t.Fatalf("carol's balance is incorrect: expected %v got %v",
 			carolExpectedBalance,
 			carolBalResp.ConfirmedBalance)
+	}
+
+	// Finally, we check that alice and carol have the set of resolutions
+	// we expect.
+	assertReports(ctxb, t, alice, op, aliceReports)
+	assertReports(ctxb, t, carol, op, carolReports)
+}
+
+type sweptOutput struct {
+	OutPoint wire.OutPoint
+	SweepTx  string
+}
+
+// findCommitAndAnchor looks for a commitment sweep and anchor sweep in the
+// mempool. Our anchor output is identified by having multiple inputs, because
+// we have to bring another input to add fees to the anchor. Note that the
+// anchor swept output may be nil if the channel did not have anchors.
+func findCommitAndAnchor(t *harnessTest, net *lntest.NetworkHarness,
+	sweepTxns []*chainhash.Hash, closeTx string) (*sweptOutput, *sweptOutput) {
+
+	var commitSweep, anchorSweep *sweptOutput
+
+	for _, tx := range sweepTxns {
+		sweepTx, err := net.Miner.Node.GetRawTransaction(tx)
+		require.NoError(t.t, err)
+
+		// We expect our commitment sweep to have a single input, and,
+		// our anchor sweep to have more inputs (because the wallet
+		// needs to add balance to the anchor amount). We find their
+		// sweep txids here to setup appropriate resolutions. We also
+		// need to find the outpoint for our resolution, which we do by
+		// matching the inputs to the sweep to the close transaction.
+		inputs := sweepTx.MsgTx().TxIn
+		if len(inputs) == 1 {
+			commitSweep = &sweptOutput{
+				OutPoint: inputs[0].PreviousOutPoint,
+				SweepTx:  tx.String(),
+			}
+		} else {
+			// Since we have more than one input, we run through
+			// them to find the outpoint that spends from the close
+			// tx. This will be our anchor output.
+			for _, txin := range inputs {
+				outpointStr := txin.PreviousOutPoint.Hash.String()
+				if outpointStr == closeTx {
+					anchorSweep = &sweptOutput{
+						OutPoint: txin.PreviousOutPoint,
+						SweepTx:  tx.String(),
+					}
+				}
+			}
+		}
+	}
+
+	return commitSweep, anchorSweep
+}
+
+// assertReports checks that the count of resolutions we have present per
+// type matches a set of expected resolutions.
+func assertReports(ctxb context.Context, t *harnessTest,
+	node *lntest.HarnessNode, channelPoint wire.OutPoint,
+	expected map[string]*lnrpc.Resolution) {
+
+	// Get our node's closed channels.
+	ctxt, cancel := context.WithTimeout(ctxb, defaultTimeout)
+	defer cancel()
+
+	closed, err := node.ClosedChannels(
+		ctxt, &lnrpc.ClosedChannelsRequest{},
+	)
+	require.NoError(t.t, err)
+
+	var resolutions []*lnrpc.Resolution
+	for _, close := range closed.Channels {
+		if close.ChannelPoint == channelPoint.String() {
+			resolutions = close.Resolutions
+			break
+		}
+	}
+
+	require.NotNil(t.t, resolutions)
+	require.Equal(t.t, len(expected), len(resolutions))
+
+	for _, res := range resolutions {
+		outPointStr := fmt.Sprintf("%v:%v", res.Outpoint.TxidStr,
+			res.Outpoint.OutputIndex)
+
+		expected, ok := expected[outPointStr]
+		require.True(t.t, ok)
+		require.Equal(t.t, expected, res)
 	}
 }
 
@@ -4354,6 +4692,187 @@ func testSphinxReplayPersistence(net *lntest.NetworkHarness, t *harnessTest) {
 
 	// Cleanup by mining the force close and sweep transaction.
 	cleanupForceClose(t, net, carol, chanPoint)
+}
+
+func assertChannelConstraintsEqual(
+	t *harnessTest, want, got *lnrpc.ChannelConstraints) {
+
+	if want.CsvDelay != got.CsvDelay {
+		t.Fatalf("CsvDelay mismatched, want: %v, got: %v",
+			want.CsvDelay, got.CsvDelay,
+		)
+	}
+
+	if want.ChanReserveSat != got.ChanReserveSat {
+		t.Fatalf("ChanReserveSat mismatched, want: %v, got: %v",
+			want.ChanReserveSat, got.ChanReserveSat,
+		)
+	}
+
+	if want.DustLimitSat != got.DustLimitSat {
+		t.Fatalf("DustLimitSat mismatched, want: %v, got: %v",
+			want.DustLimitSat, got.DustLimitSat,
+		)
+	}
+
+	if want.MaxPendingAmtMsat != got.MaxPendingAmtMsat {
+		t.Fatalf("MaxPendingAmtMsat mismatched, want: %v, got: %v",
+			want.MaxPendingAmtMsat, got.MaxPendingAmtMsat,
+		)
+	}
+
+	if want.MinHtlcMsat != got.MinHtlcMsat {
+		t.Fatalf("MinHtlcMsat mismatched, want: %v, got: %v",
+			want.MinHtlcMsat, got.MinHtlcMsat,
+		)
+	}
+
+	if want.MaxAcceptedHtlcs != got.MaxAcceptedHtlcs {
+		t.Fatalf("MaxAcceptedHtlcs mismatched, want: %v, got: %v",
+			want.MaxAcceptedHtlcs, got.MaxAcceptedHtlcs,
+		)
+	}
+}
+
+// testListChannels checks that the response from ListChannels is correct. It
+// tests the values in all ChannelConstraints are returned as expected. Once
+// ListChannels becomes mature, a test against all fields in ListChannels should
+// be performed.
+func testListChannels(net *lntest.NetworkHarness, t *harnessTest) {
+	ctxb := context.Background()
+
+	// Create two fresh nodes and open a channel between them.
+	alice, err := net.NewNode("Alice", nil)
+	if err != nil {
+		t.Fatalf("unable to create new node: %v", err)
+	}
+	defer shutdownAndAssert(net, t, alice)
+
+	bob, err := net.NewNode("Bob", nil)
+	if err != nil {
+		t.Fatalf("unable to create new node: %v", err)
+	}
+	defer shutdownAndAssert(net, t, bob)
+
+	// Connect Alice to Bob.
+	ctxt, _ := context.WithTimeout(ctxb, defaultTimeout)
+	if err := net.ConnectNodes(ctxb, alice, bob); err != nil {
+		t.Fatalf("unable to connect alice to bob: %v", err)
+	}
+
+	// Give Alice some coins so she can fund a channel.
+	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
+	err = net.SendCoins(ctxt, btcutil.SatoshiPerBitcoin, alice)
+	if err != nil {
+		t.Fatalf("unable to send coins to alice: %v", err)
+	}
+
+	// Open a channel with 100k satoshis between Alice and Bob with Alice
+	// being the sole funder of the channel. The minial HTLC amount is set to
+	// 4200 msats.
+	const customizedMinHtlc = 4200
+
+	chanAmt := btcutil.Amount(100000)
+	ctxt, _ = context.WithTimeout(ctxb, channelOpenTimeout)
+	chanPoint := openChannelAndAssert(
+		ctxt, t, net, alice, bob,
+		lntest.OpenChannelParams{
+			Amt:     chanAmt,
+			MinHtlc: customizedMinHtlc,
+		},
+	)
+
+	// Wait for Alice and Bob to receive the channel edge from the
+	// funding manager.
+	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
+	err = alice.WaitForNetworkChannelOpen(ctxt, chanPoint)
+	if err != nil {
+		t.Fatalf("alice didn't see the alice->bob channel before "+
+			"timeout: %v", err)
+	}
+
+	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
+	err = bob.WaitForNetworkChannelOpen(ctxt, chanPoint)
+	if err != nil {
+		t.Fatalf("bob didn't see the bob->alice channel before "+
+			"timeout: %v", err)
+	}
+
+	// Alice should have one channel opened with Bob.
+	assertNodeNumChannels(t, alice, 1)
+	// Bob should have one channel opened with Alice.
+	assertNodeNumChannels(t, bob, 1)
+
+	// Get the ListChannel response from Alice.
+	listReq := &lnrpc.ListChannelsRequest{}
+	ctxb = context.Background()
+	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
+	resp, err := alice.ListChannels(ctxt, listReq)
+	if err != nil {
+		t.Fatalf("unable to query for %s's channel list: %v",
+			alice.Name(), err)
+	}
+
+	// Check the returned response is correct.
+	aliceChannel := resp.Channels[0]
+
+	// defaultConstraints is a ChannelConstraints with default values. It is
+	// used to test against Alice's local channel constraints.
+	defaultConstraints := &lnrpc.ChannelConstraints{
+		CsvDelay:          4,
+		ChanReserveSat:    1000,
+		DustLimitSat:      uint64(lnwallet.DefaultDustLimit()),
+		MaxPendingAmtMsat: 99000000,
+		MinHtlcMsat:       1,
+		MaxAcceptedHtlcs:  input.MaxHTLCNumber / 2,
+	}
+	assertChannelConstraintsEqual(
+		t, aliceChannel.LocalConstraints, defaultConstraints,
+	)
+
+	// customizedConstraints is a ChannelConstraints with customized values.
+	// Ideally, all these values can be passed in when creating the channel.
+	// Currently, only the MinHtlcMsat is customized. It is used to check
+	// against Alice's remote channel constratins.
+	customizedConstraints := &lnrpc.ChannelConstraints{
+		CsvDelay:          4,
+		ChanReserveSat:    1000,
+		DustLimitSat:      uint64(lnwallet.DefaultDustLimit()),
+		MaxPendingAmtMsat: 99000000,
+		MinHtlcMsat:       customizedMinHtlc,
+		MaxAcceptedHtlcs:  input.MaxHTLCNumber / 2,
+	}
+	assertChannelConstraintsEqual(
+		t, aliceChannel.RemoteConstraints, customizedConstraints,
+	)
+
+	// Get the ListChannel response for Bob.
+	listReq = &lnrpc.ListChannelsRequest{}
+	ctxb = context.Background()
+	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
+	resp, err = bob.ListChannels(ctxt, listReq)
+	if err != nil {
+		t.Fatalf("unable to query for %s's channel "+
+			"list: %v", bob.Name(), err)
+	}
+
+	bobChannel := resp.Channels[0]
+	if bobChannel.ChannelPoint != aliceChannel.ChannelPoint {
+		t.Fatalf("Bob's channel point mismatched, want: %s, got: %s",
+			chanPoint.String(), bobChannel.ChannelPoint,
+		)
+	}
+
+	// Check channel constraints match. Alice's local channel constraint should
+	// be equal to Bob's remote channel constraint, and her remote one should
+	// be equal to Bob's local one.
+	assertChannelConstraintsEqual(
+		t, aliceChannel.LocalConstraints, bobChannel.RemoteConstraints,
+	)
+	assertChannelConstraintsEqual(
+		t, aliceChannel.RemoteConstraints, bobChannel.LocalConstraints,
+	)
+
 }
 
 func testListPayments(net *lntest.NetworkHarness, t *harnessTest) {
@@ -13813,7 +14332,7 @@ func testHoldInvoicePersistence(net *lntest.NetworkHarness, t *harnessTest) {
 	ctxt, _ = context.WithTimeout(ctxb, defaultTimeout)
 	err = carol.WaitForNetworkChannelOpen(ctxt, chanPointAlice)
 	if err != nil {
-		t.Fatalf("alice didn't see the alice->carol channel before "+
+		t.Fatalf("carol didn't see the carol->alice channel before "+
 			"timeout: %v", err)
 	}
 
@@ -14220,11 +14739,6 @@ func testExternalFundingChanPoint(net *lntest.NetworkHarness, t *harnessTest) {
 		t.Fatalf("unable to gen pending chan ID: %v", err)
 	}
 
-	_, currentHeight, err := net.Miner.Node.GetBestBlock()
-	if err != nil {
-		t.Fatalf("unable to get current blockheight %v", err)
-	}
-
 	// Now that we have the pending channel ID, Dave (our responder) will
 	// register the intent to receive a new channel funding workflow using
 	// the pending channel ID.
@@ -14233,7 +14747,7 @@ func testExternalFundingChanPoint(net *lntest.NetworkHarness, t *harnessTest) {
 			FundingTxidBytes: txid[:],
 		},
 	}
-	thawHeight := uint32(currentHeight + 10)
+	thawHeight := uint32(10)
 	chanPointShim := &lnrpc.ChanPointShim{
 		Amt:       int64(chanSize),
 		ChanPoint: chanPoint,
@@ -14431,6 +14945,10 @@ var testsCases = []*testCase{
 		test: testSweepAllCoins,
 	},
 	{
+		name: "recovery info",
+		test: testGetRecoveryInfo,
+	},
+	{
 		name: "onchain fund recovery",
 		test: testOnchainFundRecovery,
 	},
@@ -14481,6 +14999,10 @@ var testsCases = []*testCase{
 	{
 		name: "sphinx replay persistence",
 		test: testSphinxReplayPersistence,
+	},
+	{
+		name: "list channels",
+		test: testListChannels,
 	},
 	{
 		name: "list outgoing payments",
@@ -14664,6 +15186,14 @@ var testsCases = []*testCase{
 	{
 		name: "send multi path payment",
 		test: testSendMultiPathPayment,
+	},
+	{
+		name: "REST API",
+		test: testRestApi,
+	},
+	{
+		name: "intercept forwarded htlc packets",
+		test: testForwardInterceptor,
 	},
 }
 

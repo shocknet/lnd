@@ -56,6 +56,10 @@ type RegistryConfig struct {
 	// AcceptKeySend indicates whether we want to accept spontaneous key
 	// send payments.
 	AcceptKeySend bool
+
+	// KeysendHoldTime indicates for how long we want to accept and hold
+	// spontaneous keysend payments.
+	KeysendHoldTime time.Duration
 }
 
 // htlcReleaseEvent describes an htlc auto-release event. It is used to release
@@ -165,10 +169,7 @@ func (i *InvoiceRegistry) populateExpiryWatcher() error {
 func (i *InvoiceRegistry) Start() error {
 	// Start InvoiceExpiryWatcher and prepopulate it with existing active
 	// invoices.
-	err := i.expiryWatcher.Start(func(paymentHash lntypes.Hash) error {
-		cancelIfAccepted := false
-		return i.cancelInvoiceImpl(paymentHash, cancelIfAccepted)
-	})
+	err := i.expiryWatcher.Start(i.cancelInvoiceImpl)
 
 	if err != nil {
 		return err
@@ -639,7 +640,6 @@ func (i *InvoiceRegistry) cancelSingleHtlc(invoiceRef channeldb.InvoiceRef,
 // processKeySend just-in-time inserts an invoice if this htlc is a keysend
 // htlc.
 func (i *InvoiceRegistry) processKeySend(ctx invoiceUpdateCtx) error {
-
 	// Retrieve keysend record if present.
 	preimageSlice, ok := ctx.customRecords[record.KeySendType]
 	if !ok {
@@ -676,6 +676,15 @@ func (i *InvoiceRegistry) processKeySend(ctx invoiceUpdateCtx) error {
 		return errors.New("final expiry too soon")
 	}
 
+	// The invoice database indexes all invoices by payment address, however
+	// legacy keysend payment do not have one. In order to avoid a new
+	// payment type on-disk wrt. to indexing, we'll continue to insert a
+	// blank payment address which is special cased in the insertion logic
+	// to not be indexed. In the future, once AMP is merged, this should be
+	// replaced by generating a random payment address on the behalf of the
+	// sender.
+	payAddr := channeldb.BlankPayAddr
+
 	// Create placeholder invoice.
 	invoice := &channeldb.Invoice{
 		CreationDate: i.cfg.Clock.Now(),
@@ -683,8 +692,14 @@ func (i *InvoiceRegistry) processKeySend(ctx invoiceUpdateCtx) error {
 			FinalCltvDelta:  finalCltvDelta,
 			Value:           amt,
 			PaymentPreimage: &preimage,
+			PaymentAddr:     payAddr,
 			Features:        features,
 		},
+	}
+
+	if i.cfg.KeysendHoldTime != 0 {
+		invoice.HodlInvoice = true
+		invoice.Terms.Expiry = i.cfg.KeysendHoldTime
 	}
 
 	// Insert invoice into database. Ignore duplicates, because this
@@ -829,10 +844,6 @@ func (i *InvoiceRegistry) notifyExitHopHtlcLocked(
 		return nil, err
 	}
 
-	if updateSubscribers {
-		i.notifyClients(ctx.hash, invoice, invoice.State)
-	}
-
 	switch res := resolution.(type) {
 	case *HtlcFailResolution:
 		// Inspect latest htlc state on the invoice. If it is found,
@@ -850,8 +861,6 @@ func (i *InvoiceRegistry) notifyExitHopHtlcLocked(
 		ctx.log(fmt.Sprintf("failure resolution result "+
 			"outcome: %v, at accept height: %v",
 			res.Outcome, res.AcceptHeight))
-
-		return res, nil
 
 	// If the htlc was settled, we will settle any previously accepted
 	// htlcs and notify our peer to settle them.
@@ -883,8 +892,6 @@ func (i *InvoiceRegistry) notifyExitHopHtlcLocked(
 			i.notifyHodlSubscribers(htlcSettleResolution)
 		}
 
-		return resolution, nil
-
 	// If we accepted the htlc, subscribe to the hodl invoice and return
 	// an accept resolution with the htlc's accept time on it.
 	case *htlcAcceptResolution:
@@ -915,11 +922,19 @@ func (i *InvoiceRegistry) notifyExitHopHtlcLocked(
 		}
 
 		i.hodlSubscribe(hodlChan, ctx.circuitKey)
-		return res, nil
 
 	default:
 		panic("unknown action")
 	}
+
+	// Now that the links have been notified of any state changes to their
+	// HTLCs, we'll go ahead and notify any clients wiaiting on the invoice
+	// state changes.
+	if updateSubscribers {
+		i.notifyClients(ctx.hash, invoice, invoice.State)
+	}
+
+	return resolution, nil
 }
 
 // SettleHodlInvoice sets the preimage of a hodl invoice.

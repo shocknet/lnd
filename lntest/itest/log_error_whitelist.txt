@@ -70,6 +70,7 @@
 <time> [ERR] FNDG: Unable to send node announcement: gossiper is shutting down
 <time> [ERR] FNDG: Unable to send node announcement: router shutting down
 <time> [ERR] HSWC: AmountBelowMinimum(amt=<amt>, update=(lnwire.ChannelUpdate) {
+<time> [ERR] HSWC: ChannelLink(<chan>): failing link: ChannelPoint(<chan_point>): received error from peer: chan_id=<hex>, err=sync error with error: remote error
 <time> [ERR] HSWC: ChannelLink(<chan>): failing link: ChannelPoint(<chan_point>): received error from peer: chan_id=<hex>, err=invalid update with error: remote error
 <time> [ERR] HSWC: ChannelLink(<chan>): failing link: unable to handle upstream settle HTLC: Invalid payment preimage <hex> for hash <hex> with error: invalid update
 <time> [ERR] HSWC: ChannelLink(<chan>): failing link: unable to synchronize channel states: ChannelPoint(<chan_point>) with CommitPoint(<hex>) had possible local commitment state data loss with error: unable to resume channel, recovery required
@@ -89,12 +90,12 @@
 <time> [ERR] HSWC: ChannelLink(<chan>): unhandled error while forwarding htlc packet over htlcswitch: insufficient bandwidth to route htlc
 <time> [ERR] HSWC: ChannelLink(<chan>): unhandled error while forwarding htlc packet over htlcswitch: node configured to disallow forwards
 <time> [ERR] HSWC: ChannelLink(<chan>): unhandled error while forwarding htlc packet over htlcswitch: UnknownNextPeer
-<time> [ERR] HSWC: ChannelLink(<chan>): Unhandled error while reforwarding htlc settle/fail over htlcswitch: AmountBelowMinimum(amt=<amt>, update=(lnwire.ChannelUpdate) {
-<time> [ERR] HSWC: ChannelLink(<chan>): Unhandled error while reforwarding htlc settle/fail over htlcswitch: circuit has already been closed
-<time> [ERR] HSWC: ChannelLink(<chan>): Unhandled error while reforwarding htlc settle/fail over htlcswitch: FeeInsufficient(htlc_amt==<amt>, update=(lnwire.ChannelUpdate) {
-<time> [ERR] HSWC: ChannelLink(<chan>): Unhandled error while reforwarding htlc settle/fail over htlcswitch: insufficient bandwidth to route htlc
-<time> [ERR] HSWC: ChannelLink(<chan>): Unhandled error while reforwarding htlc settle/fail over htlcswitch: node configured to disallow forwards
-<time> [ERR] HSWC: ChannelLink(<chan>): Unhandled error while reforwarding htlc settle/fail over htlcswitch: UnknownNextPeer
+<time> [ERR] HSWC: Unhandled error while reforwarding htlc settle/fail over htlcswitch: AmountBelowMinimum(amt=<amt>, update=(lnwire.ChannelUpdate) {
+<time> [ERR] HSWC: Unhandled error while reforwarding htlc settle/fail over htlcswitch: circuit has already been closed
+<time> [ERR] HSWC: Unhandled error while reforwarding htlc settle/fail over htlcswitch: FeeInsufficient(htlc_amt==<amt>, update=(lnwire.ChannelUpdate) {
+<time> [ERR] HSWC: Unhandled error while reforwarding htlc settle/fail over htlcswitch: insufficient bandwidth to route htlc
+<time> [ERR] HSWC: Unhandled error while reforwarding htlc settle/fail over htlcswitch: node configured to disallow forwards
+<time> [ERR] HSWC: Unhandled error while reforwarding htlc settle/fail over htlcswitch: UnknownNextPeer
 <time> [ERR] HSWC: ChannelLink(<chan>): failing link: unable to synchronize channel states: unable to send chan sync message for ChannelPoint(<chan_point>): set tcp <ip>: use of closed network connection with error: unable to resume channel, recovery required
 <time> [ERR] HSWC: FeeInsufficient(htlc_amt==<amt>, update=(lnwire.ChannelUpdate) {
 <time> [ERR] HSWC: insufficient bandwidth to route htlc
@@ -130,6 +131,8 @@
 <time> [ERR] PEER: unable to send msg to remote peer: peer exiting
 <time> [ERR] PEER: unable to send msg to remote peer: write tcp <ip>-><ip>: write: broken pipe
 <time> [ERR] PEER: unable to send msg to remote peer: write tcp <ip>-><ip>: write: connection reset by peer
+<time> [ERR] RPCS: [/chainrpc.ChainNotifier/RegisterBlockEpochNtfn]: chain notifier shutting down
+<time> [ERR] RPCS: [/chainrpc.ChainNotifier/RegisterBlockEpochNtfn]: context canceled
 <time> [ERR] RPCS: [/invoicesrpc.Invoices/SubscribeSingleInvoice]: rpc error: code = Canceled desc = context canceled
 <time> [ERR] RPCS: [/lnrpc.Lightning/CloseChannel]: cannot co-op close frozen channel as initiator until height=<height>, (current_height=<height>)
 <time> [ERR] RPCS: [/lnrpc.Lightning/CloseChannel]: cannot co-op close frozen channel as initiator until height=3059, (current_height=3055)
@@ -188,3 +191,4 @@
 <time> [ERR] FNDG: Unable to advance state(<chan_point>): failed adding to router graph: error sending channel announcement: gossiper is shutting down
 <time> [ERR] PEER: unable to close channel, ChannelID(<hex>) is unknown
 <time> [ERR] HSWC: ChannelLink(<chan>): unable to update signals
+<time> [ERR] RPCS: [/routerrpc.Router/HtlcInterceptor]: rpc error: code = Canceled desc = context canceled

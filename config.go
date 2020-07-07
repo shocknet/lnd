@@ -80,6 +80,11 @@ const (
 
 	defaultAlias = ""
 	defaultColor = "#3399FF"
+
+	// defaultHostSampleInterval is the default amount of time that the
+	// HostAnnouncer will wait between DNS resolutions to check if the
+	// backing IP of a host has changed.
+	defaultHostSampleInterval = time.Minute * 5
 )
 
 var (
@@ -157,8 +162,10 @@ type Config struct {
 	RawRESTListeners []string `long:"restlisten" description:"Add an interface/port/socket to listen for REST connections"`
 	RawListeners     []string `long:"listen" description:"Add an interface/port to listen for peer connections"`
 	RawExternalIPs   []string `long:"externalip" description:"Add an ip:port to the list of local addresses we claim to listen on to peers. If a port is not specified, the default (9735) will be used regardless of other parameters"`
+	ExternalHosts    []string `long:"externalhosts" description:"A set of hosts that should be periodically resolved to announce IPs for"`
 	RPCListeners     []net.Addr
 	RESTListeners    []net.Addr
+	RestCORS         []string `long:"restcors" description:"Add an ip:port/hostname to allow cross origin access from. To allow all origins, set as \"*\"."`
 	Listeners        []net.Addr
 	ExternalIPs      []net.Addr
 	DisableListen    bool          `long:"nolisten" description:"Disable listening for incoming peer connections"`
@@ -231,6 +238,8 @@ type Config struct {
 	EnableUpfrontShutdown bool `long:"enable-upfront-shutdown" description:"If true, option upfront shutdown script will be enabled. If peers that we open channels with support this feature, we will automatically set the script to which cooperative closes should be paid out to on channel open. This offers the partial protection of a channel peer disconnecting from us if cooperative close is attempted with a different script."`
 
 	AcceptKeySend bool `long:"accept-keysend" description:"If true, spontaneous payments through keysend will be accepted. [experimental]"`
+
+	KeysendHoldTime time.Duration `long:"keysend-hold-time" description:"If non-zero, keysend payments are accepted but not immediately settled. If the payment isn't settled manually after the specified time, it is canceled automatically. [experimental]"`
 
 	Routing *routing.Conf `group:"routing" namespace:"routing"`
 
@@ -655,6 +664,10 @@ func ValidateConfig(cfg Config, usageMessage string) (*Config, error) {
 	if cfg.DisableListen && cfg.NAT {
 		return nil, errors.New("NAT traversal cannot be used when " +
 			"listening is disabled")
+	}
+	if cfg.NAT && len(cfg.ExternalHosts) != 0 {
+		return nil, errors.New("NAT support and externalhosts are " +
+			"mutually exclusive, only one should be selected")
 	}
 
 	// Determine the active chain configuration and its parameters.
