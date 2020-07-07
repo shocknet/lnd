@@ -10,7 +10,7 @@ before_build:
 build_script:
 - sh: make release buildtags="experimental" tag=v0.10.3-beta
 - sh: cd ~/projects/lnd-v2pn9 && find . -maxdepth 1 -mindepth 1 -type d -name "lnd-*"
-- sh: cd ~/projects/lnd-v2pn9 && cd $(find . -maxdepth 1 -mindepth 1 -type d -name "lnd-*"|head -n 1) && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.zip" -exec github-release upload --owner=Emad-salah --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \; && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.tar" -exec github-release upload --owner=Emad-salah --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \; && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.tar.gz" -exec github-release upload --owner=Emad-salah --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \;
+- sh: cd ~/projects/lnd-v2pn9 && cd $(find . -maxdepth 1 -mindepth 1 -type d -name "lnd-*"|head -n 1) && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.zip" -exec github-release upload --owner=shocknet --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \; && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.tar" -exec github-release upload --owner=shocknet --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \; && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.tar.gz" -exec github-release upload --owner=shocknet --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \;
 test: off
 # deploy:
 # - provider: GitHub
