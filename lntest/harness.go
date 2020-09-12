@@ -403,7 +403,9 @@ func (n *NetworkHarness) connect(ctx context.Context,
 tryconnect:
 	if _, err := a.ConnectPeer(ctx, req); err != nil {
 		// If the chain backend is still syncing, retry.
-		if err == lnd.ErrServerNotActive {
+		if strings.Contains(err.Error(), lnd.ErrServerNotActive.Error()) ||
+			strings.Contains(err.Error(), "i/o timeout") {
+
 			select {
 			case <-time.After(100 * time.Millisecond):
 				goto tryconnect
@@ -853,6 +855,11 @@ type OpenChannelParams struct {
 	// MinHtlc is the htlc_minimum_msat value set when opening the channel.
 	MinHtlc lnwire.MilliSatoshi
 
+	// RemoteMaxHtlcs is the remote_max_htlcs value set when opening the
+	// channel, restricting the number of concurrent HTLCs the remote party
+	// can add to a commitment.
+	RemoteMaxHtlcs uint16
+
 	// FundingShim is an optional funding shim that the caller can specify
 	// in order to modify the channel funding workflow.
 	FundingShim *lnrpc.FundingShim
@@ -872,7 +879,7 @@ func (n *NetworkHarness) OpenChannel(ctx context.Context,
 	// prevents any funding workflows from being kicked off if the chain
 	// isn't yet synced.
 	if err := srcNode.WaitForBlockchainSync(ctx); err != nil {
-		return nil, fmt.Errorf("enable to sync srcNode chain: %v", err)
+		return nil, fmt.Errorf("unable to sync srcNode chain: %v", err)
 	}
 	if err := destNode.WaitForBlockchainSync(ctx); err != nil {
 		return nil, fmt.Errorf("unable to sync destNode chain: %v", err)
@@ -891,6 +898,7 @@ func (n *NetworkHarness) OpenChannel(ctx context.Context,
 		MinConfs:           minConfs,
 		SpendUnconfirmed:   p.SpendUnconfirmed,
 		MinHtlcMsat:        int64(p.MinHtlc),
+		RemoteMaxHtlcs:     uint32(p.RemoteMaxHtlcs),
 		FundingShim:        p.FundingShim,
 	}
 
@@ -1202,9 +1210,14 @@ func (n *NetworkHarness) WaitForChannelClose(ctx context.Context,
 }
 
 // AssertChannelExists asserts that an active channel identified by the
-// specified channel point exists from the point-of-view of the node.
+// specified channel point exists from the point-of-view of the node. It takes
+// an optional set of check functions which can be used to make further
+// assertions using channel's values. These functions are responsible for
+// failing the test themselves if they do not pass.
+// nolint: interfacer
 func (n *NetworkHarness) AssertChannelExists(ctx context.Context,
-	node *HarnessNode, chanPoint *wire.OutPoint) error {
+	node *HarnessNode, chanPoint *wire.OutPoint,
+	checks ...func(*lnrpc.Channel)) error {
 
 	req := &lnrpc.ListChannelsRequest{}
 
@@ -1216,12 +1229,20 @@ func (n *NetworkHarness) AssertChannelExists(ctx context.Context,
 
 		for _, channel := range resp.Channels {
 			if channel.ChannelPoint == chanPoint.String() {
-				if channel.Active {
-					return nil
+				// First check whether our channel is active,
+				// failing early if it is not.
+				if !channel.Active {
+					return fmt.Errorf("channel %s inactive",
+						chanPoint)
 				}
 
-				return fmt.Errorf("channel %s inactive",
-					chanPoint)
+				// Apply any additional checks that we would
+				// like to verify.
+				for _, check := range checks {
+					check(channel)
+				}
+
+				return nil
 			}
 		}
 
