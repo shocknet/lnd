@@ -21,3 +21,7 @@ jobs:
         with:
           owner: lightningnetwork
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          head: master
+          base: sync
+          merge_method: merge
+          pr_title: Fork Sync
