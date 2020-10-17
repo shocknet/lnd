@@ -1,7 +1,6 @@
 language: go
 cache:
   directories:
-    - ~/bitcoin/bitcoin-0.19.1/bin
     - $DOWNLOAD_CACHE
     - $GOCACHE
     - $GOPATH/pkg/mod
@@ -17,12 +16,13 @@ git:
   depth: false
 
 go:
-  - "1.14.x"
+  - "1.15.x"
 
 env:
   global:
     - GOCACHE=$HOME/.go-build
     - DOWNLOAD_CACHE=$HOME/download_cache
+    - BITCOIN_VERSION=0.20.1
 
 sudo: required
 
@@ -52,10 +52,15 @@ jobs:
       script:
         - make itest
 
-    - name: Bitcoind Integration
+    - name: Bitcoind Integration (txindex enabled)
       script:
         - bash ./scripts/install_bitcoind.sh
         - make itest backend=bitcoind
+
+    - name: Bitcoind Integration (txindex disabled)
+      script:
+        - bash ./scripts/install_bitcoind.sh
+        - make itest backend="bitcoind notxindex"
 
     - name: Neutrino Integration
       script:
