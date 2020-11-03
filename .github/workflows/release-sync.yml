@@ -2,6 +2,11 @@ name: Get latest release version
 on:
   schedule:
     - cron:  '0 13 * * *'
+  workflow_dispatch:
+    inputs:
+      name:
+        description: 'Bump Wizard Version'
+        required: false
 jobs:
   get-version:
     runs-on: ubuntu-latest
