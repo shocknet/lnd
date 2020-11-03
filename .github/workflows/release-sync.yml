@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       name:
-        description: 'Bump Wizard Version'
+        description: 'Manually run build'
         required: false
 jobs:
   get-version:
@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v2
         with:
-          token: ${{ secrets.REPO_SCOPED_TOKEN }}
+          token: ${{ secrets.REPO_ACCESS_TOKEN }}
       - name: Fetch release version
         run: |
           curl -sL https://api.github.com/repos/lightningnetwork/lnd/releases/latest | \
