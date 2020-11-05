@@ -7,6 +7,8 @@ before_build:
 - sh: export COMMIT_LOG=`git log -1 --format='%ci %H %s'`
 - sh: npm install -g @babel/runtime github-release-cli
 build_script:
+- sh: pwd 
+- sh: ls
 - sh: make release tags="experimental autopilotrpc signrpc walletrpc chainrpc invoicesrpc routerrpc" sys="windows-amd64 windows-arm linux-arm64 linux-amd64 linux-armv6 linux-armv7 darwin-amd64 darwin-386"
 - sh: cd ~/projects/lnd-v2pn9 && find . -maxdepth 1 -mindepth 1 -type d -name "lnd-*"
 - sh: cd ~/projects/lnd-v2pn9 && cd $(find . -maxdepth 1 -mindepth 1 -type d -name "lnd-*"|head -n 1) && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.zip" -exec github-release upload --owner=shocknet --repo=lnd --tag="$(< ~/projects/lnd-v2pn9/release-versions/lnd-latest.txt)" --name="$(< ~/projects/lnd-v2pn9/release-versions/lnd-latest.txt) Experimental" --body="${COMMIT_LOG}" {} \; && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.tar" -exec github-release upload --owner=shocknet --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \; && find . -maxdepth 1 -mindepth 1 -type f -name "lnd-*.tar.gz" -exec github-release upload --owner=shocknet --repo=lnd --tag=$APPVEYOR_BUILD_VERSION --name=$APPVEYOR_REPO_BRANCH --body="${COMMIT_LOG}" {} \;
