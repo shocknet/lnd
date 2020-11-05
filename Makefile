@@ -175,6 +175,27 @@ itest-only:
 
 itest: btcd build-itest itest-only
 
+itest-parallel: btcd
+	@$(call print, "Building lnd binary")
+	CGO_ENABLED=0 $(GOBUILD) -tags="$(ITEST_TAGS)" -o lntest/itest/lnd-itest $(ITEST_LDFLAGS) $(PKG)/cmd/lnd
+
+	@$(call print, "Building itest binary for $(backend) backend")
+	CGO_ENABLED=0 $(GOTEST) -v ./lntest/itest -tags="$(DEV_TAGS) $(RPC_TAGS) rpctest $(backend)" -logoutput -goroutinedump -c -o lntest/itest/itest.test
+
+	@$(call print, "Running tests")
+	rm -rf lntest/itest/*.log lntest/itest/.logs-*
+	echo -n "$$(seq 0 $$(expr $(NUM_ITEST_TRANCHES) - 1))" | xargs -P $(NUM_ITEST_TRANCHES) -n 1 -I {} scripts/itest_part.sh {} $(NUM_ITEST_TRANCHES) $(TEST_FLAGS)
+
+itest-parallel-windows: btcd
+	@$(call print, "Building lnd binary")
+	CGO_ENABLED=0 $(GOBUILD) -tags="$(ITEST_TAGS)" -o lntest/itest/lnd-itest.exe $(ITEST_LDFLAGS) $(PKG)/cmd/lnd
+
+	@$(call print, "Building itest binary for $(backend) backend")
+	CGO_ENABLED=0 $(GOTEST) -v ./lntest/itest -tags="$(DEV_TAGS) $(RPC_TAGS) rpctest $(backend)" -logoutput -goroutinedump -c -o lntest/itest/itest.test.exe
+
+	@$(call print, "Running tests")
+	EXEC_SUFFIX=".exe" echo -n "$$(seq 0 $$(expr $(NUM_ITEST_TRANCHES) - 1))" | xargs -P $(NUM_ITEST_TRANCHES) -n 1 -I {} scripts/itest_part.sh {} $(NUM_ITEST_TRANCHES) $(TEST_FLAGS)
+
 itest-windows: btcd build-itest-windows itest-only
 
 unit: btcd
@@ -269,12 +290,12 @@ vendor:
 ios: vendor mobile-rpc
 	@$(call print, "Building iOS framework ($(IOS_BUILD)).")
 	mkdir -p $(IOS_BUILD_DIR)
-	$(GOMOBILE_BIN) bind -target=ios -tags="mobile $(DEV_TAGS) autopilotrpc experimental" $(LDFLAGS) -v -o $(IOS_BUILD) $(MOBILE_PKG)
+	$(GOMOBILE_BIN) bind -target=ios -tags="mobile $(DEV_TAGS) autopilotrpc" $(LDFLAGS) -v -o $(IOS_BUILD) $(MOBILE_PKG)
 
 android: vendor mobile-rpc
 	@$(call print, "Building Android library ($(ANDROID_BUILD)).")
 	mkdir -p $(ANDROID_BUILD_DIR)
-	$(GOMOBILE_BIN) bind -target=android -tags="mobile $(DEV_TAGS) autopilotrpc experimental" $(LDFLAGS) -v -o $(ANDROID_BUILD) $(MOBILE_PKG)
+	$(GOMOBILE_BIN) bind -target=android -tags="mobile $(DEV_TAGS) autopilotrpc" $(LDFLAGS) -v -o $(ANDROID_BUILD) $(MOBILE_PKG)
 
 mobile: ios android
 
