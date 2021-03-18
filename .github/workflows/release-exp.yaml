@@ -1,0 +1,93 @@
+name: Get latest release and create new experimental release
+on:
+  schedule:
+    - cron: "59 23 * * *"
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+    working-directory: main
+
+jobs:
+  build-experimental:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@master
+        with:
+          repository: "lightningnetwork/lnd"
+          persist-credentials: false
+          fetch-depth: 0 # otherwise, you will failed to push refs to dest repo
+          path: main
+
+      - name: Fetch release version
+        run: |
+          export LND_RELEASE=$(curl -sL https://api.github.com/repos/lightningnetwork/lnd/releases/latest)
+          export S_LND_RELEASE=$(curl -sL https://api.github.com/repos/${{ github.repository }}/releases/latest)
+
+          export LND_RELEASE_TAG=$(jq -r ".tag_name" <<< "${LND_RELEASE}")
+          export S_LND_RELEASE_TAG=$(jq -r ".tag_name" <<< "${S_LND_RELEASE}")
+
+
+          echo "LND_LATEST=${LND_RELEASE_TAG}" >> $GITHUB_ENV
+          echo "S_LND_LATEST=${S_LND_RELEASE_TAG}" >> $GITHUB_ENV
+
+      - name: Checkout to the latest release Git tag
+        if: ${{ env.LND_LATEST != env.S_LND_LATEST }}
+        run: |
+          git checkout ${{ env.LND_LATEST }}
+
+      - name: Build the latest version with experimental flag
+        if: ${{ env.LND_LATEST != env.S_LND_LATEST }}
+        run: |
+          make release tags="experimental autopilotrpc signrpc walletrpc chainrpc invoicesrpc routerrpc" sys="windows-amd64 windows-arm linux-arm64 linux-amd64 linux-armv6 linux-armv7 darwin-amd64"
+
+      - name: Check for modified files
+        id: git-check
+        run: |
+          echo ::set-output name=modified::$([ -z "`git status --porcelain`" ] && echo "false" || echo "true")
+
+      - name: Checkout fork repo
+        if: steps.git-check.outputs.modified == 'true'
+        uses: actions/checkout@v2
+        with:
+          repository: ${{ github.repository }}
+          path: fork
+
+      - name: Push latest release tag to Shocknet fork
+        if: steps.git-check.outputs.modified == 'true'
+        run: |
+          cd $GITHUB_WORKSPACE/fork
+
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+
+          echo ${{ env.LND_LATEST }} > LATEST_RELEASE
+
+          git add LATEST_RELEASE
+          git commit -m "Build and Release ${{ env.LND_LATEST }}"
+          git tag -a ${{ env.LND_LATEST }} -m "Release ${{ env.LND_LATEST }}"
+
+          git push -u origin master --tags
+
+      - name: Release the experimental version
+        uses: softprops/action-gh-release@master
+        if: steps.git-check.outputs.modified == 'true'
+        with:
+          files: |
+            main/lnd-2*/*.tar.gz
+            main/lnd-2*/*.zip
+          body: |
+            Experimental release of ${{ env.LND_LATEST }} containing: 
+            - experimental
+            - autopilotrpc
+            - signrpc
+            - walletrpc
+            - chainrpc
+            - invoicesrpc 
+            - routerrpc
+          draft: false
+          tag_name: ${{ env.LND_LATEST }}
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
